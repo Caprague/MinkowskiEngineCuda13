@@ -8,8 +8,11 @@ MinkowskiEngine can be installed with CUDA 12, but ensure that your PyTorch and 
 * PyTorch does not have version for CUDA 12.2, install PyTorch compatible with CUDA 12.1
 * I am using PyTorch 2.4.0 because I need to install `pytorch-scatter` `pytorch-sparse` `pyg` that are built on torch 2.4.0. You can use other versions such as PyTorch 2.5.1
 
+## Installation with Docker
 
-## Steps for Installation
+Checkout the updated `Dockerfile` in my [branch](https://github.com/CiSong10/MinkowskiEngine/tree/cuda12-installation). Thanks to this [comment by @QuteSaltyFish](https://github.com/NVIDIA/MinkowskiEngine/issues/620#issuecomment-3128267425)
+
+## Steps for Local Installation
 
 ```
 mamba create -n <env_name> python=3.9
