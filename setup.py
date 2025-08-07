@@ -311,6 +311,7 @@ ext_modules = [
     Extension(
         name="MinkowskiEngineBackend._C",
         sources=[*[str(SRC_PATH / src_file) for src_file in SRC_FILES], *BIND_FILES],
+        define_macros=[('NVTX_DISABLE', None)],
         extra_compile_args={"cxx": CC_FLAGS, "nvcc": NVCC_FLAGS},
         libraries=libraries,
     ),
