@@ -13,5 +13,5 @@ MinkowskiEngine.egg-info/
 output/
 ModelNet40.tgz
 ModelNet40/
-ConstructTerrain/
+DataCollection/
 
