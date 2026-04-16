@@ -90,6 +90,7 @@ parser.add_argument("--save_dir",           type=str,                   default=
 # lidar_completion, lidar_completion_old, lidar_completion_test, lidar_completion_4layer_v0, lidar_completion_4layer_v1
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v1")
 parser.add_argument("--load_optimizer",     type=str,                   default="true")
+parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
 parser.add_argument("--eval",               action="store_true")
 
@@ -411,6 +412,7 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         self.cache = {}                         # 样本加载缓存
         self.last_cache_percent = 0             # 样本缓存比例
         self.force_norm = config.force_norm     # 强制归一化
+        self.cache_use = config.cache_use
         
         # 修改根目录路径以适应新数据集结构
         self.root = "./DataCollection"  # 根据实际数据集路径调整
@@ -507,14 +509,16 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         data_list = []
         
         for pcd_path in pcd_paths:
-            # # 缓存检查
-            # if pcd_path in self.cache:
-            #     points = self.cache[pcd_path]
-            # else:
+            if self.cache_use:
+                # 缓存检查
+                if pcd_path in self.cache:
+                    points = self.cache[pcd_path]
+                    data_list.append(points)
+                    continue
+            
             # 读取 PCD 文件
             pcd = o3d.io.read_point_cloud(pcd_path)
             points = np.asarray(pcd.points)
-            
             # 检查点云是否为空，确保数据有效性
             if len(points) == 0:
                 error_msg = f"Empty point cloud detected in file: {pcd_path}. Data integrity check failed."
@@ -547,9 +551,10 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
                     )
                     logging.error(error_msg)
                     assert False, error_msg
-                
-                # # 存入缓存
-                # self.cache[pcd_path] = points
+            
+            if self.cache_use:
+                # 存入缓存
+                self.cache[pcd_path] = points
 
             # 时序性存入列表
             data_list.append(points)
@@ -1226,6 +1231,9 @@ def train(net, dataloader, device, config):
         iter_loss = sum(step_total_losses)/len(step_total_losses)
         writer.add_scalar('Time/Iter_Total_Time', total_time, i)
         writer.add_scalar('Loss/Iter_Loss', iter_loss, i)
+        # 记录学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Params/LR', current_lr, i)
         
         # 打印训练 info
         if i % config.stat_freq_iter == 0:
