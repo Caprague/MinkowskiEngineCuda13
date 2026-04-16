@@ -1045,7 +1045,7 @@ class LidarCompletionNet(nn.Module):
 
 def train(net, dataloader, device, config):
     # 初始化 SummaryWriter
-    timestamp = strftime("%Y%m%d_%H%M%S", time.localtime())
+    timestamp = strftime("%Y%m%d_%H%M%S", localtime())
     run_log_dir = os.path.join(config.log_dir, timestamp)
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
