@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data.sampler import Sampler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -79,17 +80,17 @@ parser.add_argument("--force_norm",         type=bool,      default=False)
 parser.add_argument("--max_iter",           type=int,       default=5001)
 parser.add_argument("--stat_freq_iter",     type=int,       default=50)
 parser.add_argument("--lr_step",            type=int,       default=100)
-parser.add_argument("--save_freq_iter",     type=int,       default=250)
+parser.add_argument("--save_freq_iter",     type=int,       default=100)
 parser.add_argument("--batch_size",         type=int,       default=4)
-parser.add_argument("--lr",                 type=float,     default=1e-2)
+parser.add_argument("--lr",                 type=float,     default=1e-3)
 parser.add_argument("--alpha",              type=float,     default=0.5)
 parser.add_argument("--momentum",           type=float,     default=0.9)
 parser.add_argument("--weight_decay",       type=float,     default=1e-4)
 parser.add_argument("--num_workers",        type=int,       default=4)
 parser.add_argument("--log_dir",            type=str,       default="./output/logs")
 parser.add_argument("--save_dir",           type=str,       default="./output/chechpoint")
-# parser.add_argument("--model_name",         type=str,       default="lidar_completion")
-parser.add_argument("--model_name",         type=str,       default="lidar_completion_test")
+# lidar_completion, lidar_completion_old, lidar_completion_test, lidar_completion_4layer_v0
+parser.add_argument("--model_name",         type=str,       default="lidar_completion_4layer_v0")
 parser.add_argument("--load_optimizer",     type=str,       default="true")
 parser.add_argument("--max_visualization",  type=int,       default=4)
 parser.add_argument("--eval",               action="store_true")
@@ -245,6 +246,150 @@ def make_data_loader(phase, augment_data, batch_size, shuffle, num_workers, repe
     return loader
 
 
+@torch.jit.script
+def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
+    """Convert rotations given as quaternions to rotation matrices.
+
+    Args:
+        quaternions: The quaternion orientation in (w, x, y, z). Shape is (..., 4).
+
+    Returns:
+        Rotation matrices. The shape is (..., 3, 3).
+
+    Reference:
+        https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/transforms/rotation_conversions.py#L41-L70
+    """
+    r, i, j, k = torch.unbind(quaternions, -1)
+    # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
+    )
+    return o.reshape(quaternions.shape[:-1] + (3, 3))
+
+
+def transform_points(
+    points: torch.Tensor, pos: torch.Tensor | None = None, quat: torch.Tensor | None = None
+) -> torch.Tensor:
+    r"""Transform input points in a given frame to a target frame.
+
+    This function transform points from a source frame to a target frame. The transformation is defined by the
+    position :math:`t` and orientation :math:`R` of the target frame in the source frame.
+
+    .. math::
+        p_{target} = R_{target} \times p_{source} + t_{target}
+
+    If the input `points` is a batch of points, the inputs `pos` and `quat` must be either a batch of
+    positions and quaternions or a single position and quaternion. If the inputs `pos` and `quat` are
+    a single position and quaternion, the same transformation is applied to all points in the batch.
+
+    If either the inputs :attr:`pos` and :attr:`quat` are None, the corresponding transformation is not applied.
+
+    Args:
+        points: Points to transform. Shape is (N, P, 3) or (P, 3).
+        pos: Position of the target frame. Shape is (N, 3) or (3,).
+            Defaults to None, in which case the position is assumed to be zero.
+        quat: Quaternion orientation of the target frame in (w, x, y, z). Shape is (N, 4) or (4,).
+            Defaults to None, in which case the orientation is assumed to be identity.
+
+    Returns:
+        Transformed points in the target frame. Shape is (N, P, 3) or (P, 3).
+
+    Raises:
+        ValueError: If the inputs `points` is not of shape (N, P, 3) or (P, 3).
+        ValueError: If the inputs `pos` is not of shape (N, 3) or (3,).
+        ValueError: If the inputs `quat` is not of shape (N, 4) or (4,).
+    """
+    points_batch = points.clone()
+    # check if inputs are batched
+    is_batched = points_batch.dim() == 3
+    # -- check inputs
+    if points_batch.dim() == 2:
+        points_batch = points_batch[None]  # (P, 3) -> (1, P, 3)
+    if points_batch.dim() != 3:
+        raise ValueError(f"Expected points to have dim = 2 or dim = 3: got shape {points.shape}")
+    if not (pos is None or pos.dim() == 1 or pos.dim() == 2):
+        raise ValueError(f"Expected pos to have dim = 1 or dim = 2: got shape {pos.shape}")
+    if not (quat is None or quat.dim() == 1 or quat.dim() == 2):
+        raise ValueError(f"Expected quat to have dim = 1 or dim = 2: got shape {quat.shape}")
+    # -- rotation
+    if quat is not None:
+        # convert to batched rotation matrix
+        rot_mat = matrix_from_quat(quat)
+        if rot_mat.dim() == 2:
+            rot_mat = rot_mat[None]  # (3, 3) -> (1, 3, 3)
+        # convert points to matching batch size (N, P, 3) -> (N, 3, P)
+        # and apply rotation
+        points_batch = torch.matmul(rot_mat, points_batch.transpose_(1, 2))
+        # (N, 3, P) -> (N, P, 3)
+        points_batch = points_batch.transpose_(1, 2)
+    # -- translation
+    if pos is not None:
+        # convert to batched translation vector
+        if pos.dim() == 1:
+            pos = pos[None, None, :]  # (3,) -> (1, 1, 3)
+        else:
+            pos = pos[:, None, :]  # (N, 3) -> (N, 1, 3)
+        # apply translation
+        points_batch += pos
+    # -- return points in same shape as input
+    if not is_batched:
+        points_batch = points_batch.squeeze(0)  # (1, P, 3) -> (P, 3)
+
+    return points_batch
+
+
+def points_transform_and_normclip(points_prev_list: list[torch.Tensor], 
+                                  pos_curr: torch.Tensor, quat_curr: torch.Tensor, 
+                                  pos_prev: torch.Tensor, quat_prev: torch.Tensor,
+                                  scale: float=3.2, bound: float=0.5):
+    """
+        N = num_envs
+            time K_t:
+                pos_curr shape (N, 3)
+                quat_curr shape (N, 4)
+            time K_t-1:
+                points_prev list [(P1, 3), (P2, 3), ... , (Pn, 3)] 
+                pos_prev shape (N, 3)
+                quat_prev shape (N, 4)
+    """
+    lengths = [p.shape[0] for p in points_prev_list]
+    points_prev = pad_sequence(points_prev_list, batch_first=True, padding_value=float('inf'))  # (N, P, 3)
+    
+    rot_matrix_curr = matrix_from_quat(quat_curr)                                               # (N, 4) -> (N, 3, 3)
+
+    points_world_prev = transform_points(points_prev * scale, pos_prev, quat_prev)              # (N, P, 3)
+    points_world_prev_centered = points_world_prev - pos_curr .unsqueeze(1)                     # (N, P, 3)
+    
+    points_prev_view = torch.matmul(points_world_prev_centered, rot_matrix_curr)                # (N, P, 3)
+    points_prev_view_norm = points_prev_view / scale                                            # (N, P, 3)
+
+    mask_inside = (points_prev_view_norm.abs() < bound).all(dim=2)
+    
+    has_points = mask_inside.any(dim=1)
+    if not has_points.all():
+        bad_indices = torch.where(~has_points)[0]
+        raise RuntimeError(f"数据异常：以下样本的点云在归一化裁剪后全部丢失 (Mask全为False): {bad_indices.tolist()}。请检查输入点云范围或增大 bound 值。")
+    
+    inside_lengths = mask_inside.sum(dim=1)
+    all_inside_points = points_prev_view_norm[mask_inside]
+    points_prev_inside_list = torch.split(all_inside_points, inside_lengths.tolist())
+
+    return points_prev_inside_list
+
+
 ###############################################################################
 # End of utility functions
 ###############################################################################
@@ -269,7 +414,8 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         self.last_cache_percent = 0             # 样本缓存比例
         self.force_norm = config.force_norm     # 强制归一化
         
-        self.root = "./ConstructTerrain"
+        # 修改根目录路径以适应新数据集结构
+        self.root = "./DataCollection"  # 根据实际数据集路径调整
         
         # 如果指定了 type (如 "walk")，则列表只包含该目录
         if self.type is not None:
@@ -284,10 +430,11 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         for current_type in type_dirs:
             partial_root = os.path.join(self.root, current_type, self.phase, "partial")
             complete_root = os.path.join(self.root, current_type, self.phase, "complete")
+            transform_root = os.path.join(self.root, current_type, self.phase, "transform")
         
             # 检查目录是否存在，确保配置的运动类别有效
-            if not os.path.exists(partial_root) or not os.path.exists(complete_root):
-                error_msg = f"Directory not found for type '{current_type}'. Checked paths:\n  Partial: {partial_root}\n  Complete: {complete_root}"
+            if not os.path.exists(partial_root) or not os.path.exists(complete_root) or not os.path.exists(transform_root):
+                error_msg = f"Directory not found for type '{current_type}'. Checked paths:\n  Partial: {partial_root}\n  Complete: {complete_root}\n  Transform: {transform_root}"
                 logging.error(error_msg)
                 raise FileNotFoundError(error_msg)
             
@@ -298,10 +445,17 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
                 # 对应构建 Comple 序列样本文件夹路径
                 seq_idx_s = os.path.basename(os.path.normpath(partial_seq_path))    # 获取 "0001"
                 complete_seq_path = os.path.join(complete_root, seq_idx_s)          # 组合到 complete_root
-            
+                transform_path = os.path.join(transform_root, f"{seq_idx_s}.npz")   # 对应的变换文件路径
+                
                 # 检查 complete 目录是否存在，确保数据配对完整性
                 if not os.path.exists(complete_seq_path):
                     error_msg = f"Missing complete data for {seq_idx_s} at path: {complete_seq_path}. Data integrity check failed."
+                    logging.error(error_msg)
+                    raise FileNotFoundError(error_msg)
+                
+                # 检查 transform 文件是否存在
+                if not os.path.exists(transform_path):
+                    error_msg = f"Missing transform data for {seq_idx_s} at path: {transform_path}. Data integrity check failed."
                     logging.error(error_msg)
                     raise FileNotFoundError(error_msg)
                 
@@ -314,14 +468,30 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
                     error_msg = f"Frame count mismatch in {seq_idx_s}: found {len(p_fnames)} partial frames and {len(c_fnames)} complete frames."
                     logging.error(error_msg)
                     raise ValueError(error_msg)
+                
+                # 加载变换数据
+                transform_data = np.load(transform_path)
+                pos_data = transform_data['pos']  # (N, 3) 位置数据
+                quat_data = transform_data['quat']  # (N, 4) 姿态数据
+                
+                # 检查变换数据的帧数是否匹配
+                if len(pos_data) != len(p_fnames) or len(quat_data) != len(p_fnames):
+                    error_msg = f"Transform data frame count mismatch in {seq_idx_s}: found {len(p_fnames)} pcd frames but {len(pos_data)} pos frames and {len(quat_data)} quat frames."
+                    logging.error(error_msg)
+                    raise ValueError(error_msg)
             
                 # 将这一组时序样本加入列表
-                self.samples.append({
-                    'type': current_type,
-                    'seq_idx': seq_idx_s,
-                    'partial_paths': p_fnames,    # 明确表明存储的是文件路径列表
-                    'complete_paths': c_fnames    # 明确表明存储的是文件路径列表
-                })
+                self.samples.append(
+                    {
+                        'type': current_type,
+                        'seq_idx': seq_idx_s,
+                        'partial_paths': p_fnames,          # 明确表明存储的是文件路径列表
+                        'complete_paths': c_fnames,         # 明确表明存储的是文件路径列表
+                        'transform_path': transform_path,   # 添加变换文件路径
+                        'pos_data': pos_data,               # 位置数据
+                        'quat_data': quat_data,             # 姿态数据
+                    }
+                )
         
         assert len(self.samples) > 0, "No paired samples loaded!"
         logging.info(f"Loaded {len(self.samples)} sequences for phase: {phase}")
@@ -339,49 +509,49 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         data_list = []
         
         for pcd_path in pcd_paths:
-            # 缓存检查
-            if pcd_path in self.cache:
-                points = self.cache[pcd_path]
-            else:
-                # 读取 PCD 文件
-                pcd = o3d.io.read_point_cloud(pcd_path)
-                points = np.asarray(pcd.points)
-                
-                # 检查点云是否为空，确保数据有效性
-                if len(points) == 0:
-                    error_msg = f"Empty point cloud detected in file: {pcd_path}. Data integrity check failed."
-                    logging.error(error_msg)
-                    raise ValueError(error_msg)
-                
-                # 检查是否在 (0, 1) 范围内
-                is_norm_type1 = (points.min() > 0.0) and (points.max() < 1.0)
-                # 检查是否在 (-0.5, 0.5) 范围内
-                is_norm_type2 = (points.min() > -0.5) and (points.max() < 0.5)
-                if not is_norm_type1:
-                    if is_norm_type2:
-                        # (-0.5, 0.5) -> (0, 1)
-                        points += 0.5
-                    elif force_norm:
-                        min_val = points.min()
-                        max_val = points.max()
-                        if max_val - min_val < 1e-8:  # 防止除零，处理所有点重合的情况
-                            points = np.zeros_like(points)
-                        else:
-                            points = (points - min_val) / (max_val - min_val)
+            # # 缓存检查
+            # if pcd_path in self.cache:
+            #     points = self.cache[pcd_path]
+            # else:
+            # 读取 PCD 文件
+            pcd = o3d.io.read_point_cloud(pcd_path)
+            points = np.asarray(pcd.points)
+            
+            # 检查点云是否为空，确保数据有效性
+            if len(points) == 0:
+                error_msg = f"Empty point cloud detected in file: {pcd_path}. Data integrity check failed."
+                logging.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # 检查是否在 (0, 1) 范围内
+            is_norm_type1 = (points.min() > 0.0) and (points.max() < 1.0)
+            # 检查是否在 (-0.5, 0.5) 范围内
+            is_norm_type2 = (points.min() > -0.51) and (points.max() < 0.51)
+            if not is_norm_type1:
+                if is_norm_type2:
+                    # (-0.5, 0.5) -> (0, 1)
+                    points += 0.5
+                elif force_norm:
+                    min_val = points.min()
+                    max_val = points.max()
+                    if max_val - min_val < 1e-8:  # 防止除零，处理所有点重合的情况
+                        points = np.zeros_like(points)
                     else:
-                        error_msg = (
-                            f"\n--- 数据归一化检查失败 (Data Normalization Check Failed) ---\n"
-                            f"File: {pcd_path}\n"
-                            f"Coordinate Range: [{points.min():.3f}, {points.max():.3f}]\n"
-                            f"Requirement: Must be in the range [0, 1] \n"
-                            f"Action: Please normalize your mesh/point cloud data before training.\n"
-                            f"--- 建议：请检查预处理脚本是否对 {pcd_path} 执行了归一化 ---"
-                        )
-                        logging.error(error_msg)
-                        assert False, error_msg
+                        points = (points - min_val) / (max_val - min_val)
+                else:
+                    error_msg = (
+                        f"\n--- 数据归一化检查失败 (Data Normalization Check Failed) ---\n"
+                        f"File: {pcd_path}\n"
+                        f"Coordinate Range: [{points.min():.3f}, {points.max():.3f}]\n"
+                        f"Requirement: Must be in the range [0, 1] \n"
+                        f"Action: Please normalize your mesh/point cloud data before training.\n"
+                        f"--- 建议：请检查预处理脚本是否对 {pcd_path} 执行了归一化 ---"
+                    )
+                    logging.error(error_msg)
+                    assert False, error_msg
                 
-                # 存入缓存
-                self.cache[pcd_path] = points
+                # # 存入缓存
+                # self.cache[pcd_path] = points
 
             # 时序性存入列表
             data_list.append(points)
@@ -396,6 +566,8 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
             'num_frames': len(sample_info['partial_paths']),
             'partial': self._load_pcd_sequence(sample_info['partial_paths'], self.force_norm),
             'complete': self._load_pcd_sequence(sample_info['complete_paths'], self.force_norm),
+            'pos_data': sample_info['pos_data'],
+            'quat_data': sample_info['quat_data'],
         }
 
         if self.transform:
@@ -459,25 +631,37 @@ class CollationAndTransformation:
         num_frames_list = [data['num_frames'] for data in list_data]
         partial_list = [data['partial'] for data in list_data]
         complete_list = [data['complete'] for data in list_data]
+        pos_data_list = [data['pos_data'] for data in list_data]
+        quat_data_list = [data['quat_data'] for data in list_data]
         
         num_frames_tensor = torch.tensor(num_frames_list)
         if torch.all(num_frames_tensor == num_frames_tensor[0]):
             final_num_frames = int(num_frames_tensor[0].item())
             turncated_p_list = partial_list
             turncated_c_list = complete_list
+            turncated_pos_list = pos_data_list
+            turncated_quat_list = quat_data_list
         else:
             min_frames = int(num_frames_tensor.min().item())
             final_num_frames = min_frames
             turncated_p_list = [seq[:min_frames] for seq in partial_list]
             turncated_c_list = [seq[:min_frames] for seq in complete_list]
+            turncated_pos_list = [seq[:min_frames] for seq in pos_data_list]
+            turncated_quat_list = [seq[:min_frames] for seq in quat_data_list]
             
         time_p_list = []
         time_c_list = []
+        time_pos_list = []
+        time_quat_list = []
         for t in range(final_num_frames):
             t_p_coords = [sample_seq[t] for sample_seq in turncated_p_list]
             t_c_coords = [sample_seq[t] for sample_seq in turncated_c_list]
+            t_pos_data = [sample_seq[t] for sample_seq in turncated_pos_list]
+            t_quat_data = [sample_seq[t] for sample_seq in turncated_quat_list]
             time_p_list.append(t_p_coords)
             time_c_list.append(t_c_coords)
+            time_pos_list.append(t_pos_data)
+            time_quat_list.append(t_quat_data)
 
         return {
             'type': type_list,
@@ -485,6 +669,8 @@ class CollationAndTransformation:
             'num_frames': final_num_frames,
             'partial': time_p_list,
             'complete': time_c_list,
+            'pos_data': time_pos_list,
+            'quat_data': time_quat_list,
         }
 
 
@@ -910,11 +1096,16 @@ def train(net, dataloader, device, config):
         
         # 按照时序遍历
         num_frames = data_dict['num_frames']    
-        sout_coords_list, sout_feats_list = None, None
+        sout_points_norm_list, sout_points_float_list = None, None
         for t in range(num_frames):
             # 获取原始点云序列 (List[np.ndarray])
             t_p_points_list_np = data_dict['partial'][t]
             t_c_points_list_np = data_dict['complete'][t]
+            # 获取变换数据
+            t_pos_data_list_np = data_dict['pos_data'][t]
+            t_quat_data_list_np = data_dict['quat_data'][t]
+            _t_pos_data_list_np = data_dict['pos_data'][(t - 1) if t != 0 else 0]
+            _t_quat_data_list_np = data_dict['quat_data'][(t - 1) if t != 0 else 0]
             # 将 Numpy List 转换为 Torch List
             t_p_points_list = [
                 torch.from_numpy(p).float().to(device) 
@@ -923,6 +1114,22 @@ def train(net, dataloader, device, config):
             t_c_points_list = [
                 torch.from_numpy(p).float().to(device) 
                 for p in t_c_points_list_np
+            ]
+            t_pos_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in t_pos_data_list_np
+            ]
+            t_quat_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in t_quat_data_list_np
+            ]
+            _t_pos_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in _t_pos_data_list_np
+            ]
+            _t_quat_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in _t_quat_data_list_np
             ]
             # 体素坐标量化，List[np.ndarray]
             _, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
@@ -939,13 +1146,15 @@ def train(net, dataloader, device, config):
                     batched_hist_coords = batched_curr_coords.detach()
                     batched_hist_feats = batched_curr_feats.detach()
                 else:
-                    sout_feats_list_xyzt = []
-                    for feats in sout_feats_list:
-                        time_encoding = torch.ones(feats.shape[0], 1, device=feats.device, dtype=feats.dtype)
-                        sout_feats_list_xyzt.append(torch.cat([feats, time_encoding], dim=1))
-                    batched_hist_coords_raw, batched_hist_feats_raw = ME.utils.sparse_collate(sout_coords_list, sout_feats_list_xyzt, device=device)
-                    batched_hist_coords = batched_hist_coords_raw.detach()
-                    batched_hist_feats = batched_hist_feats_raw.detach()
+                    hist_points_norm_list = points_transform_and_normclip(sout_points_norm_list,
+                                                                        torch.stack(t_pos_data_list), 
+                                                                        torch.stack(t_quat_data_list), 
+                                                                        torch.stack(_t_pos_data_list), 
+                                                                        torch.stack(_t_quat_data_list), 
+                                                                        scale=3.2, bound=0.5)
+                    _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
+                    hist_feats_list = compute_feats(hist_coords_float_list, hist_coords_voxel_list, 1.0)
+                    batched_hist_coords, batched_hist_feats = ME.utils.sparse_collate(hist_coords_voxel_list, hist_feats_list, device=device)
             
             # 清除梯度
             optimizer.zero_grad()
@@ -979,11 +1188,13 @@ def train(net, dataloader, device, config):
             
             # reconstruct points
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
-            _, sout_coords_float_list = devoxelization(sout_coords_list, sout_feats_list, res=config.resolution)
+            detached_sout_coords_list = [coords.detach() for coords in sout_coords_list]
+            detached_sout_feats_list = [feats.detach() for feats in sout_feats_list]
+            sout_points_norm_list, sout_points_float_list = devoxelization(detached_sout_coords_list, detached_sout_feats_list, res=config.resolution)
         
             # 计算 Chamfer Distance Loss
             num_batchs, batch_chamfer_loss = len(t_c_coords_float_list), 0
-            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_float_list):
+            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_points_float_list):
                 batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
             points_reg_loss = batch_chamfer_loss / num_batchs
             step_reg_losses.append(points_reg_loss.item())
@@ -1107,11 +1318,16 @@ def visualize(net, dataloader, device, config):
         
         # 按照时序遍历
         num_frames = data_dict['num_frames']
-        sout_coords_list, sout_feats_list = None, None
+        sout_points_norm_list, sout_points_float_list = None, None
         for t in range(num_frames):
             # 获取原始点云序列 (List[np.ndarray])
             t_p_points_list_np = data_dict['partial'][t]
             t_c_points_list_np = data_dict['complete'][t]
+            # 获取变换数据
+            t_pos_data_list_np = data_dict['pos_data'][t]
+            t_quat_data_list_np = data_dict['quat_data'][t]
+            _t_pos_data_list_np = data_dict['pos_data'][(t - 1) if t != 0 else 0]
+            _t_quat_data_list_np = data_dict['quat_data'][(t - 1) if t != 0 else 0]
             # 将 Numpy List 转换为 Torch List
             t_p_points_list = [
                 torch.from_numpy(p).float().to(device) 
@@ -1120,6 +1336,22 @@ def visualize(net, dataloader, device, config):
             t_c_points_list = [
                 torch.from_numpy(p).float().to(device) 
                 for p in t_c_points_list_np
+            ]
+            t_pos_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in t_pos_data_list_np
+            ]
+            t_quat_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in t_quat_data_list_np
+            ]
+            _t_pos_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in _t_pos_data_list_np
+            ]
+            _t_quat_data_list = [
+                torch.from_numpy(p).float().to(device) 
+                for p in _t_quat_data_list_np
             ]
             # 体素坐标量化，List[np.ndarray]
             t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
@@ -1137,14 +1369,15 @@ def visualize(net, dataloader, device, config):
                     batched_hist_feats = batched_curr_feats.detach()
                     hist_points_norm_list = t_p_points_norm_list
                 else:
-                    sout_feats_list_xyzt = []
-                    for feats in sout_feats_list:
-                        time_encoding = torch.ones(feats.shape[0], 1, device=feats.device, dtype=feats.dtype)
-                        sout_feats_list_xyzt.append(torch.cat([feats, time_encoding], dim=1))
-                    batched_hist_coords_raw, batched_hist_feats_raw = ME.utils.sparse_collate(sout_coords_list, sout_feats_list_xyzt, device=device)
-                    batched_hist_coords = batched_hist_coords_raw.detach()
-                    batched_hist_feats = batched_hist_feats_raw.detach()
-                    hist_points_norm_list, _ = devoxelization(sout_coords_list, sout_feats_list, res=config.resolution)
+                    hist_points_norm_list = points_transform_and_normclip(sout_points_norm_list,
+                                                                        torch.stack(t_pos_data_list), 
+                                                                        torch.stack(t_quat_data_list), 
+                                                                        torch.stack(_t_pos_data_list), 
+                                                                        torch.stack(_t_quat_data_list), 
+                                                                        scale=3.2, bound=0.5)
+                    _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
+                    hist_feats_list = compute_feats(hist_coords_float_list, hist_coords_voxel_list, 1.0)
+                    batched_hist_coords, batched_hist_feats = ME.utils.sparse_collate(hist_coords_voxel_list, hist_feats_list, device=device)
             
             # 共享坐标管理器
             cm = ME.CoordinateManager(D=3)
@@ -1175,11 +1408,13 @@ def visualize(net, dataloader, device, config):
             
             # reconstruct points
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
-            sout_points_norm_list, sout_coords_float_list = devoxelization(sout_coords_list, sout_feats_list, res=config.resolution)
+            detached_sout_coords_list = [coords.detach() for coords in sout_coords_list]
+            detached_sout_feats_list = [feats.detach() for feats in sout_feats_list]
+            sout_points_norm_list, sout_points_float_list = devoxelization(detached_sout_coords_list, detached_sout_feats_list, res=config.resolution)
         
             # 计算 Chamfer Distance Loss
             num_batchs, batch_chamfer_loss = len(t_c_coords_float_list), 0
-            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_float_list):
+            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_points_float_list):
                 batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
             points_reg_loss = batch_chamfer_loss / num_batchs
             step_reg_losses.append(points_reg_loss.item())
