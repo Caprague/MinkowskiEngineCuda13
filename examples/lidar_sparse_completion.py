@@ -75,27 +75,26 @@ logging.basicConfig(
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--resolution",         type=int,       default=128)
-parser.add_argument("--force_norm",         type=bool,      default=False)
-parser.add_argument("--max_iter",           type=int,       default=5001)
-parser.add_argument("--stat_freq_iter",     type=int,       default=50)
-parser.add_argument("--lr_step",            type=int,       default=100)
-parser.add_argument("--save_freq_iter",     type=int,       default=100)
-parser.add_argument("--batch_size",         type=int,       default=4)
-parser.add_argument("--lr",                 type=float,     default=1e-3)
-parser.add_argument("--alpha",              type=float,     default=0.5)
-parser.add_argument("--momentum",           type=float,     default=0.9)
-parser.add_argument("--weight_decay",       type=float,     default=1e-4)
-parser.add_argument("--num_workers",        type=int,       default=4)
-parser.add_argument("--log_dir",            type=str,       default="./output/logs")
-parser.add_argument("--save_dir",           type=str,       default="./output/chechpoint")
-# lidar_completion, lidar_completion_old, lidar_completion_test, lidar_completion_4layer_v0
-parser.add_argument("--model_name",         type=str,       default="lidar_completion_4layer_v0")
-parser.add_argument("--load_optimizer",     type=str,       default="true")
-parser.add_argument("--max_visualization",  type=int,       default=4)
+parser.add_argument("--resolution",         type=int,                   default=64)
+parser.add_argument("--force_norm",         type=bool,                  default=False)
+parser.add_argument("--max_iter",           type=int,                   default=10001)
+parser.add_argument("--stat_freq_iter",     type=int,                   default=10)
+parser.add_argument("--save_freq_iter",     type=int,                   default=100)
+parser.add_argument("--batch_size",         type=int,                   default=8)
+parser.add_argument("--lr",                 type=float,                 default=1e-3)
+parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
+parser.add_argument("--betas",              type=tuple(float, float),   default=(0.9, 0.995))
+parser.add_argument("--alpha",              type=float,                 default=0.8)
+parser.add_argument("--num_workers",        type=int,                   default=4)
+parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
+parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
+# lidar_completion, lidar_completion_old, lidar_completion_test, lidar_completion_4layer_v0, lidar_completion_4layer_v1
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v1")
+parser.add_argument("--load_optimizer",     type=str,                   default="true")
+parser.add_argument("--max_visualization",  type=int,                   default=4)
 parser.add_argument("--eval",               action="store_true")
 
-PURNING_THRESHOLD = 0.5
+PURNING_THRESHOLD = 0.35
 ENC_CHANNELS = [32, 64, 128, 256, 512]
 DEC_CHANNELS = [32, 64, 128, 256, 512]
 
@@ -1046,14 +1045,12 @@ def train(net, dataloader, device, config):
     writer = SummaryWriter(log_dir=config.log_dir)
     
     # 初始化 SGD 优化器
-    optimizer = optim.SGD(
+    optimizer = optim.AdamW(
         net.parameters(),
-        lr=config.lr,
-        momentum=config.momentum,
-        weight_decay=config.weight_decay,
+        lr=config.lr,                    
+        weight_decay=config.weight_decay,          
+        betas=config.betas,         
     )
-    # 初始化 LR 学习率控制器
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.95)
 
     # 初始化损失函数
     crit1 = ChamferDistanceLoss().to(device)
@@ -1066,7 +1063,7 @@ def train(net, dataloader, device, config):
     train_iter = iter(dataloader)
     
     # 记录初始学习率
-    current_lr = scheduler.get_lr()[0]
+    current_lr = optimizer.param_groups[0]['lr']
     logging.info(f"LR: {current_lr}")
     writer.add_scalar('Params/LR', current_lr, 0)
     
@@ -1252,20 +1249,10 @@ def train(net, dataloader, device, config):
                 {
                     "state_dict": net.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
                     "curr_iter": i,
                 },
                 model_save_file,
             )
-            # 切换训练模式
-            net.train()
-        
-        # 学习率控制器更新
-        if i % config.lr_step == 0 and i > 0:
-            scheduler.step()
-            current_lr = scheduler.get_lr()[0]
-            logging.info(f"LR: {current_lr}")
-            writer.add_scalar('Params/LR', current_lr, i)
             # 切换训练模式
             net.train()
 
