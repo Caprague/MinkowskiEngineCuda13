@@ -29,7 +29,7 @@ import subprocess
 import argparse
 import logging
 import numpy as np
-from time import time, strftime
+from time import time, strftime, localtime
 import urllib
 
 # Must be imported before large libs
