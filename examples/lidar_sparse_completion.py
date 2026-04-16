@@ -87,8 +87,7 @@ parser.add_argument("--alpha",              type=float,                 default=
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
-# lidar_completion, lidar_completion_old, lidar_completion_test, lidar_completion_4layer_v0, lidar_completion_4layer_v1
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v1")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v2")
 parser.add_argument("--load_optimizer",     type=str,                   default="true")
 parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
@@ -366,6 +365,7 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
     """
     lengths = [p.shape[0] for p in points_prev_list]
     points_prev = pad_sequence(points_prev_list, batch_first=True, padding_value=float('inf'))  # (N, P, 3)
+    points_prev -= 0.5                                                                          # (0, 1) -> (-0.5, +0.5)
     
     rot_matrix_curr = matrix_from_quat(quat_curr)                                               # (N, 4) -> (N, 3, 3)
 
@@ -384,7 +384,7 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
     
     inside_lengths = mask_inside.sum(dim=1)
     all_inside_points = points_prev_view_norm[mask_inside]
-    points_prev_inside_list = torch.split(all_inside_points, inside_lengths.tolist())
+    points_prev_inside_list = torch.split(all_inside_points + 0.5, inside_lengths.tolist())     # (-0.5, +0.5) -> (0, 1)
 
     return points_prev_inside_list
 
@@ -1045,8 +1045,11 @@ class LidarCompletionNet(nn.Module):
 
 def train(net, dataloader, device, config):
     # 初始化 SummaryWriter
-    os.makedirs(config.log_dir, exist_ok=True) 
-    writer = SummaryWriter(log_dir=config.log_dir)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    run_log_dir = os.path.join(config.log_dir, timestamp)
+    os.makedirs(run_log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=run_log_dir)
+    print(f"📝 TensorBoard logs saved to: {run_log_dir}")
     
     # 初始化 SGD 优化器
     optimizer = optim.AdamW(
