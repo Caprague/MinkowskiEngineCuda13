@@ -29,7 +29,7 @@ import subprocess
 import argparse
 import logging
 import numpy as np
-from time import time
+from time import time, strftime
 import urllib
 
 # Must be imported before large libs
@@ -1045,7 +1045,7 @@ class LidarCompletionNet(nn.Module):
 
 def train(net, dataloader, device, config):
     # 初始化 SummaryWriter
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    timestamp = strftime("%Y%m%d_%H%M%S", time.localtime())
     run_log_dir = os.path.join(config.log_dir, timestamp)
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
