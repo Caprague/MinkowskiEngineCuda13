@@ -561,7 +561,8 @@ def train(net, dataloader, device, config):
     for i in range(config.max_iter):
 
         s = time()
-        data_dict = train_iter.next()
+        # data_dict = train_iter.next()
+        data_dict = next(train_iter)
         d = time() - s
 
         optimizer.zero_grad()

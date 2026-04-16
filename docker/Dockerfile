@@ -4,14 +4,16 @@
 # ARG CUDNN="8"
 
 ARG PYTORCH="2.7.0"
-ARG CUDA="12.6"
+ARG CUDA="12.8"
 ARG CUDNN="9"
 
 FROM pytorch/pytorch:${PYTORCH}-cuda${CUDA}-cudnn${CUDNN}-devel
 ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
 
 ARG CUDA_SM_LIST="6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.9 9.0 12.0"
+ENV TORCH_CUDA_ARCH_LIST="${CUDA_SM_LIST}"
 
+ENV https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 all_proxy=socks5://127.0.0.1:7897
 
 # Install dependencies
 RUN apt-get update
@@ -20,6 +22,8 @@ RUN apt-get install -y git ninja-build cmake build-essential libopenblas-dev \
 
 # Build
 WORKDIR /workspace
+RUN git config --global http.proxy http://127.0.0.1:7897
+RUN git config --global https.proxy http://127.0.0.1:7897
 RUN git clone https://github.com/CiSong10/MinkowskiEngine.git && \
     cd MinkowskiEngine && \
     git checkout cuda12-installation 
