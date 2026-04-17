@@ -83,7 +83,7 @@ parser.add_argument("--save_freq_iter",     type=int,                   default=
 parser.add_argument("--batch_size",         type=int,                   default=8)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
-parser.add_argument("--alpha",              type=float,                 default=0.8)
+parser.add_argument("--alpha",              type=float,                 default=0.5)
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
@@ -1137,7 +1137,8 @@ def train(net, dataloader, device, config):
             ]
             # 体素坐标量化，List[np.ndarray]
             _, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
-            _, t_c_coords_float_list, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+            _, _, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+            t_c_coords_float_list = [pc * config.resolution for pc in t_c_points_list]
             # 计算输入点云坐标对应的特征，List[np.ndarray]
             t_p_feats_list = compute_feats(t_p_coords_float_list, t_p_coords_voxel_list, 0.0)
             # 当前感知点云，稀疏张量聚合
@@ -1352,7 +1353,8 @@ def visualize(net, dataloader, device, config):
             ]
             # 体素坐标量化，List[np.ndarray]
             t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
-            t_c_points_norm_list, t_c_coords_float_list, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+            _, _, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+            t_c_coords_float_list = [pc * config.resolution for pc in t_c_points_list]
             # 计算输入点云坐标对应的特征，List[np.ndarray]
             t_p_feats_list = compute_feats(t_p_coords_float_list, t_p_coords_voxel_list, 0.0)
             # 当前感知点云，稀疏张量聚合
@@ -1438,7 +1440,7 @@ def visualize(net, dataloader, device, config):
             # sin hist
             sin_hist_pc = hist_points_norm_list[0].cpu().numpy()
             # gt
-            gt_pc = t_c_points_norm_list[0].cpu().numpy()
+            gt_pc = t_c_points_list[0].cpu().numpy()
             # sout
             sout_pc = sout_points_norm_list[0].cpu().detach().numpy()
             
