@@ -87,7 +87,7 @@ parser.add_argument("--alpha",              type=float,                 default=
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v2")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v3")
 parser.add_argument("--load_optimizer",     type=str,                   default="true")
 parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
