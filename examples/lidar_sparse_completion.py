@@ -90,14 +90,13 @@ parser.add_argument("--log_dir",            type=str,                   default=
 parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_4layer_v4")
 parser.add_argument("--load_optimizer",     type=str,                   default="true")
-parser.add_argument("--cache_use",          type=bool,                  default=False)
+parser.add_argument("--cache_use",          type=bool,                  default=True)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
 parser.add_argument("--eval",               action="store_true")
 
 PURNING_THRESHOLD = 0.35
 ENC_CHANNELS = [32, 64, 128, 256, 512]
 DEC_CHANNELS = [32, 64, 128, 256, 512]
-BATCHNORM_ENABLE = False
 
 ###############################################################################
 # End of global configs
@@ -1221,7 +1220,7 @@ def train(net, dataloader, device, config):
             total_loss = alpha * voxel_cls_loss + beta * points_reg_loss
             
             # 反向传播损失，梯度更新网络权重
-            total_loss.backward(retain_graph=True)
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=config.max_norm)
             optimizer.step()
 
