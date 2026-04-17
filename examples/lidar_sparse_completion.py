@@ -80,10 +80,11 @@ parser.add_argument("--force_norm",         type=bool,                  default=
 parser.add_argument("--max_iter",           type=int,                   default=10001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=10)
 parser.add_argument("--save_freq_iter",     type=int,                   default=100)
-parser.add_argument("--batch_size",         type=int,                   default=8)
+parser.add_argument("--batch_size",         type=int,                   default=4)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
 parser.add_argument("--alpha",              type=float,                 default=0.5)
+parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/chechpoint")
@@ -96,6 +97,7 @@ parser.add_argument("--eval",               action="store_true")
 PURNING_THRESHOLD = 0.35
 ENC_CHANNELS = [32, 64, 128, 256, 512]
 DEC_CHANNELS = [32, 64, 128, 256, 512]
+BATCHNORM_ENABLE = False
 
 ###############################################################################
 # End of global configs
@@ -743,7 +745,7 @@ class LidarCompletionNet(nn.Module):
         # Input features capture layer
         self.enc_block_s1 = nn.Sequential(
             ME.MinkowskiConvolution(4, enc_ch[0], kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(enc_ch[0]),
+            # ME.MinkowskiBatchNorm(enc_ch[0]),
             ME.MinkowskiELU(),
         )
 
@@ -753,10 +755,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[0], enc_ch[1], kernel_size=2, stride=2, dimension=3
             ),
-            ME.MinkowskiBatchNorm(enc_ch[1]),
+            # ME.MinkowskiBatchNorm(enc_ch[1]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[1], enc_ch[1], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(enc_ch[1]),
+            # ME.MinkowskiBatchNorm(enc_ch[1]),
             ME.MinkowskiELU(),
         )
 
@@ -765,10 +767,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[1], enc_ch[2], kernel_size=2, stride=2, dimension=3
             ),
-            ME.MinkowskiBatchNorm(enc_ch[2]),
+            # ME.MinkowskiBatchNorm(enc_ch[2]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[2], enc_ch[2], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(enc_ch[2]),
+            # ME.MinkowskiBatchNorm(enc_ch[2]),
             ME.MinkowskiELU(),
         )
 
@@ -777,10 +779,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[2], enc_ch[3], kernel_size=2, stride=2, dimension=3
             ),
-            ME.MinkowskiBatchNorm(enc_ch[3]),
+            # ME.MinkowskiBatchNorm(enc_ch[3]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[3], enc_ch[3], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(enc_ch[3]),
+            # ME.MinkowskiBatchNorm(enc_ch[3]),
             ME.MinkowskiELU(),
         )
 
@@ -789,10 +791,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[3], enc_ch[4], kernel_size=2, stride=2, dimension=3
             ),
-            ME.MinkowskiBatchNorm(enc_ch[4]),
+            # ME.MinkowskiBatchNorm(enc_ch[4]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[4], enc_ch[4], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(enc_ch[4]),
+            # ME.MinkowskiBatchNorm(enc_ch[4]),
             ME.MinkowskiELU(),
         )
 
@@ -813,10 +815,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            ME.MinkowskiBatchNorm(dec_ch[3]),
+            # ME.MinkowskiBatchNorm(dec_ch[3]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[3], dec_ch[3], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(dec_ch[3]),
+            # ME.MinkowskiBatchNorm(dec_ch[3]),
             ME.MinkowskiELU(),
         )
 
@@ -833,10 +835,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            ME.MinkowskiBatchNorm(dec_ch[2]),
+            # ME.MinkowskiBatchNorm(dec_ch[2]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[2], dec_ch[2], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(dec_ch[2]),
+            # ME.MinkowskiBatchNorm(dec_ch[2]),
             ME.MinkowskiELU(),
         )
 
@@ -853,10 +855,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            ME.MinkowskiBatchNorm(dec_ch[1]),
+            # ME.MinkowskiBatchNorm(dec_ch[1]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[1], dec_ch[1], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(dec_ch[1]),
+            # ME.MinkowskiBatchNorm(dec_ch[1]),
             ME.MinkowskiELU(),
         )
 
@@ -873,10 +875,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            ME.MinkowskiBatchNorm(dec_ch[0]),
+            # ME.MinkowskiBatchNorm(dec_ch[0]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[0], dec_ch[0], kernel_size=3, dimension=3),
-            ME.MinkowskiBatchNorm(dec_ch[0]),
+            # ME.MinkowskiBatchNorm(dec_ch[0]),
             ME.MinkowskiELU(),
         )
 
@@ -890,7 +892,7 @@ class LidarCompletionNet(nn.Module):
         # Output features layer
         self.dec_block_s1 = nn.Sequential(
             ME.MinkowskiConvolution(dec_ch[0], 3, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(3),
+            # ME.MinkowskiBatchNorm(3),
             ME.MinkowskiSigmoid(),
         )
 
@@ -1220,6 +1222,7 @@ def train(net, dataloader, device, config):
             
             # 反向传播损失，梯度更新网络权重
             total_loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=config.max_norm)
             optimizer.step()
 
             # 记录损失
