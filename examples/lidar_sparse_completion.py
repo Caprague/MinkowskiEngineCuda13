@@ -744,7 +744,7 @@ class LidarCompletionNet(nn.Module):
         # Input features capture layer
         self.enc_block_s1 = nn.Sequential(
             ME.MinkowskiConvolution(4, enc_ch[0], kernel_size=3, stride=1, dimension=3),
-            # ME.MinkowskiBatchNorm(enc_ch[0]),
+            ME.MinkowskiBatchNorm(enc_ch[0]),
             ME.MinkowskiELU(),
         )
 
@@ -754,10 +754,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[0], enc_ch[1], kernel_size=2, stride=2, dimension=3
             ),
-            # ME.MinkowskiBatchNorm(enc_ch[1]),
+            ME.MinkowskiBatchNorm(enc_ch[1]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[1], enc_ch[1], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(enc_ch[1]),
+            ME.MinkowskiBatchNorm(enc_ch[1]),
             ME.MinkowskiELU(),
         )
 
@@ -766,10 +766,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[1], enc_ch[2], kernel_size=2, stride=2, dimension=3
             ),
-            # ME.MinkowskiBatchNorm(enc_ch[2]),
+            ME.MinkowskiBatchNorm(enc_ch[2]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[2], enc_ch[2], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(enc_ch[2]),
+            ME.MinkowskiBatchNorm(enc_ch[2]),
             ME.MinkowskiELU(),
         )
 
@@ -778,10 +778,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[2], enc_ch[3], kernel_size=2, stride=2, dimension=3
             ),
-            # ME.MinkowskiBatchNorm(enc_ch[3]),
+            ME.MinkowskiBatchNorm(enc_ch[3]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[3], enc_ch[3], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(enc_ch[3]),
+            ME.MinkowskiBatchNorm(enc_ch[3]),
             ME.MinkowskiELU(),
         )
 
@@ -790,10 +790,10 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiConvolution(
                 enc_ch[3], enc_ch[4], kernel_size=2, stride=2, dimension=3
             ),
-            # ME.MinkowskiBatchNorm(enc_ch[4]),
+            ME.MinkowskiBatchNorm(enc_ch[4]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(enc_ch[4], enc_ch[4], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(enc_ch[4]),
+            ME.MinkowskiBatchNorm(enc_ch[4]),
             ME.MinkowskiELU(),
         )
 
@@ -814,10 +814,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            # ME.MinkowskiBatchNorm(dec_ch[3]),
+            ME.MinkowskiBatchNorm(dec_ch[3]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[3], dec_ch[3], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(dec_ch[3]),
+            ME.MinkowskiBatchNorm(dec_ch[3]),
             ME.MinkowskiELU(),
         )
 
@@ -834,10 +834,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            # ME.MinkowskiBatchNorm(dec_ch[2]),
+            ME.MinkowskiBatchNorm(dec_ch[2]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[2], dec_ch[2], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(dec_ch[2]),
+            ME.MinkowskiBatchNorm(dec_ch[2]),
             ME.MinkowskiELU(),
         )
 
@@ -854,10 +854,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            # ME.MinkowskiBatchNorm(dec_ch[1]),
+            ME.MinkowskiBatchNorm(dec_ch[1]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[1], dec_ch[1], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(dec_ch[1]),
+            ME.MinkowskiBatchNorm(dec_ch[1]),
             ME.MinkowskiELU(),
         )
 
@@ -874,10 +874,10 @@ class LidarCompletionNet(nn.Module):
                 stride=2,
                 dimension=3,
             ),
-            # ME.MinkowskiBatchNorm(dec_ch[0]),
+            ME.MinkowskiBatchNorm(dec_ch[0]),
             ME.MinkowskiELU(),
             ME.MinkowskiConvolution(dec_ch[0], dec_ch[0], kernel_size=3, dimension=3),
-            # ME.MinkowskiBatchNorm(dec_ch[0]),
+            ME.MinkowskiBatchNorm(dec_ch[0]),
             ME.MinkowskiELU(),
         )
 
@@ -891,7 +891,7 @@ class LidarCompletionNet(nn.Module):
         # Output features layer
         self.dec_block_s1 = nn.Sequential(
             ME.MinkowskiConvolution(dec_ch[0], 3, kernel_size=1, dimension=3),
-            # ME.MinkowskiBatchNorm(3),
+            ME.MinkowskiBatchNorm(3),
             ME.MinkowskiSigmoid(),
         )
 
@@ -1153,11 +1153,11 @@ def train(net, dataloader, device, config):
                     batched_hist_feats = batched_curr_feats.detach()
                 else:
                     hist_points_norm_list = points_transform_and_normclip(sout_points_norm_list,
-                                                                        torch.stack(t_pos_data_list), 
-                                                                        torch.stack(t_quat_data_list), 
-                                                                        torch.stack(_t_pos_data_list), 
-                                                                        torch.stack(_t_quat_data_list), 
-                                                                        scale=3.2, bound=0.5)
+                                                                          torch.stack(t_pos_data_list), 
+                                                                          torch.stack(t_quat_data_list), 
+                                                                          torch.stack(_t_pos_data_list), 
+                                                                          torch.stack(_t_quat_data_list), 
+                                                                          scale=3.2, bound=0.5)
                     _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
                     hist_feats_list = compute_feats(hist_coords_float_list, hist_coords_voxel_list, 1.0)
                     batched_hist_coords, batched_hist_feats = ME.utils.sparse_collate(hist_coords_voxel_list, hist_feats_list, device=device)
@@ -1371,11 +1371,11 @@ def visualize(net, dataloader, device, config):
                     hist_points_norm_list = t_p_points_norm_list
                 else:
                     hist_points_norm_list = points_transform_and_normclip(sout_points_norm_list,
-                                                                        torch.stack(t_pos_data_list), 
-                                                                        torch.stack(t_quat_data_list), 
-                                                                        torch.stack(_t_pos_data_list), 
-                                                                        torch.stack(_t_quat_data_list), 
-                                                                        scale=3.2, bound=0.5)
+                                                                          torch.stack(t_pos_data_list), 
+                                                                          torch.stack(t_quat_data_list), 
+                                                                          torch.stack(_t_pos_data_list), 
+                                                                          torch.stack(_t_quat_data_list), 
+                                                                          scale=3.2, bound=0.5)
                     _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
                     hist_feats_list = compute_feats(hist_coords_float_list, hist_coords_voxel_list, 1.0)
                     batched_hist_coords, batched_hist_feats = ME.utils.sparse_collate(hist_coords_voxel_list, hist_feats_list, device=device)
