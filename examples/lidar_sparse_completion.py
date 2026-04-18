@@ -899,11 +899,6 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiBatchNorm(3),
             ME.MinkowskiSigmoid(),
         )
-        
-        # Buffer to store last occupancy probability for history
-        self.register_buffer('last_occupancy_prob', torch.tensor([]))
-        self.last_sout_coords_list = []
-        self.last_sout_points_norm_list = []
 
     # GT target_key - Decoder inverse compute
     def get_target(self, out, target_key, kernel_size=1):
@@ -1026,10 +1021,10 @@ class LidarCompletionNet(nn.Module):
         sout = self.dec_block_s1(dec_s1)
 
         # Store last occupancy probability and coordinates for next step
-        self.last_occupancy_prob = torch.sigmoid(dec_s1_cls.F.squeeze()).detach()
+        occ_prob = torch.sigmoid(dec_s1_cls.F.squeeze()).detach()
 
         # predict voxels, gt voxels, output pc(coords + feats) 
-        return out_cls, targets, sout
+        return out_cls, targets, sout, occ_prob
 
 
 ###############################################################################
@@ -1081,11 +1076,9 @@ def train(net, dataloader, device, config):
     data_time = 0           # 单次迭代的数据加载耗时
     total_time = 0          # 单次迭代的总耗时
     
-    # Initialize last occupancy probabilities for each batch item
+    # 训练周期循环
     last_occupancy_probs = [None] * config.batch_size
     last_points_norm_list = [None] * config.batch_size
-
-    # 训练周期循环
     for i in range(config.max_iter):
         # 获取小批量训练数据
         start_time = time()
@@ -1196,7 +1189,7 @@ def train(net, dataloader, device, config):
             )
 
             # Forward
-            out_cls, out_targets, sout = net(sin_fused, in_target_key)
+            out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
             
             # Reconstruct points for loss calculation and saving for next step
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
@@ -1239,8 +1232,7 @@ def train(net, dataloader, device, config):
                 writer.add_scalar(f'Loss/Layer{layer_idx+1}_Cls_Loss', loss_val, train_steps)
                 
             # Update last occupancy probabilities and points for next step
-            if hasattr(net, 'last_occupancy_prob') and net.last_occupancy_prob.numel() > 0:
-                last_occupancy_probs = [net.last_occupancy_prob] # Simplified for single batch handling
+            last_occupancy_probs = [occ_prob]
             last_points_norm_list = sout_points_norm_list
 
         # Calculate and record iteration metrics
@@ -1426,7 +1418,7 @@ def visualize(net, dataloader, device, config):
             )
 
             # Forward
-            out_cls, out_targets, sout = net(sin_fused, in_target_key)
+            out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
             
             # Reconstruct points for loss calculation and saving for next step
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
@@ -1459,8 +1451,7 @@ def visualize(net, dataloader, device, config):
             print(f"total_loss: {total_loss}\n")
 
             # Update last occupancy probabilities and points for next step
-            if hasattr(net, 'last_occupancy_prob') and net.last_occupancy_prob.numel() > 0:
-                last_occupancy_probs = [net.last_occupancy_prob]
+            last_occupancy_probs = [occ_prob]
             last_points_norm_list = sout_points_norm_list
 
             # Get point clouds for visualization
