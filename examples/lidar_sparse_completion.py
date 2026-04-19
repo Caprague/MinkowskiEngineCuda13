@@ -76,14 +76,13 @@ logging.basicConfig(
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--resolution",         type=int,                   default=64)
-parser.add_argument("--force_norm",         type=bool,                  default=False)
 parser.add_argument("--max_iter",           type=int,                   default=10001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=10)
 parser.add_argument("--save_freq_iter",     type=int,                   default=100)
 parser.add_argument("--batch_size",         type=int,                   default=4)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
-parser.add_argument("--alpha",              type=float,                 default=0.5)
+parser.add_argument("--alpha",              type=float,                 default=0.85)
 parser.add_argument("--max_norm",           type=float,                 default=0.5)
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
@@ -107,7 +106,7 @@ DEC_CHANNELS = [32, 64, 128, 256, 512]
 # Utility functions
 ###############################################################################
 
-def voxelization(points_list, res: int=1):
+def voxelization(points_list, res: int=1, feats_list=None):
     """
     辅助函数: 进行体素尺寸放大，并使用ME量化工具进行去重
     输入:
@@ -122,8 +121,9 @@ def voxelization(points_list, res: int=1):
     unique_points_list = []
     coords_float_list = []
     coords_int_list = []
+    new_feats_list = []
     
-    for points in points_list:            
+    for i, points in enumerate(points_list):
         coords_float = points * res
         discrete_coords, indices = ME.utils.sparse_quantize(
             coordinates=coords_float, 
@@ -135,8 +135,10 @@ def voxelization(points_list, res: int=1):
         unique_points_list.append(points[indices])
         coords_float_list.append(coords_float[indices])
         coords_int_list.append(discrete_coords.int())
+        if feats_list is not None:
+            new_feats_list.append(feats_list[i][indices])
         
-    return unique_points_list, coords_float_list, coords_int_list
+    return unique_points_list, coords_float_list, coords_int_list, new_feats_list
 
 
 def devoxelization(coords_list, offsets_list, res: int=1):
@@ -176,7 +178,7 @@ def devoxelization(coords_list, offsets_list, res: int=1):
     return points_norm_list, points_list
 
 
-def compute_feats(coords_float_list, coords_voxel_list, time_encoding, prob_values=None):
+def compute_feats(coords_float_list, coords_voxel_list, time_encoding, prob):
     """
     辅助函数: 计算稀疏张量的特征 (适配 PyTorch Tensor)
     输入:
@@ -197,17 +199,12 @@ def compute_feats(coords_float_list, coords_voxel_list, time_encoding, prob_valu
             dtype=coords_float.dtype, 
             device=coords_float.device
         )
-        
-        # Handle probability values
-        if prob_values is None:
-            # Default to 1.0 for current frame
-            feats_prob = torch.ones((coords_float.shape[0], 1), dtype=coords_float.dtype, device=coords_float.device)
-        else:
-            # Use provided probabilities for history frame
-            assert isinstance(prob_values, list), "prob_values must be list type !!!"
-            prob_tensor = prob_values[i]
-            feats_prob = prob_tensor.view(-1, 1)
-        
+        feats_prob = torch.full(
+            (coords_float.shape[0], 1), 
+            prob, 
+            dtype=coords_float.dtype, 
+            device=coords_float.device
+        )
         feats = torch.cat([feats_offset, feats_temporal, feats_prob], dim=1) # Concatenate: 3 + 1 + 1 = 5
         feats_list.append(feats)
         
@@ -230,11 +227,11 @@ def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None):
     return pcd
 
 
-def make_data_loader(phase, augment_data, batch_size, shuffle, num_workers, repeat, config):
+def make_data_loader(phase, batch_size, shuffle, num_workers, repeat, config, device, augment_data, transforms):
     """
     辅助函数，用于获取 data loader
     """
-    data_set = ConstructTerrainDataset(phase=phase, config=config)
+    data_set = ConstructTerrainDataset(phase=phase, config=config, device=device, augment_data=augment_data, transforms=transforms)
 
     args = {
         "batch_size": batch_size,                       # 小批量样本尺寸
@@ -362,6 +359,7 @@ def transform_points(
 def points_transform_and_normclip(points_prev_list: list[torch.Tensor], 
                                   pos_curr: torch.Tensor, quat_curr: torch.Tensor, 
                                   pos_prev: torch.Tensor, quat_prev: torch.Tensor,
+                                  feats_prev_list: list[torch.Tensor] = None,
                                   scale: float=3.2, bound: float=0.5):
     """
         N = num_envs
@@ -380,7 +378,7 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
     rot_matrix_curr = matrix_from_quat(quat_curr)                                               # (N, 4) -> (N, 3, 3)
 
     points_world_prev = transform_points(points_prev * scale, pos_prev, quat_prev)              # (N, P, 3)
-    points_world_prev_centered = points_world_prev - pos_curr .unsqueeze(1)                     # (N, P, 3)
+    points_world_prev_centered = points_world_prev - pos_curr.unsqueeze(1)                      # (N, P, 3)
     
     points_prev_view = torch.matmul(points_world_prev_centered, rot_matrix_curr)                # (N, P, 3)
     points_prev_view_norm = points_prev_view / scale                                            # (N, P, 3)
@@ -396,6 +394,12 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
     all_inside_points = points_prev_view_norm[mask_inside]
     points_prev_inside_list = torch.split(all_inside_points + 0.5, inside_lengths.tolist())     # (-0.5, +0.5) -> (0, 1)
 
+    if feats_prev_list is not None:
+        feats_prev = pad_sequence(feats_prev_list, batch_first=True, padding_value=float('inf'))
+        all_inside_feats = feats_prev[mask_inside]
+        feats_prev_inside_list = torch.split(all_inside_feats, inside_lengths.tolist())
+        return points_prev_inside_list, feats_prev_inside_list
+
     return points_prev_inside_list
 
 
@@ -405,23 +409,64 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
 
 
 ###############################################################################
+# Preprocess functions
+###############################################################################
+
+def VoxelFilterTransform(data_dict, voxel_size=0.05):
+    """
+    Transform 函数：对 data_dict['complete'] 中的点云序列进行体素下采样 (Voxel Grid Filter)
+    
+    Args:
+        data_dict (dict): 包含 'partial', 'complete' 等键的字典。
+        voxel_size (float): 体素的边长。值越大，点云越稀疏。
+        
+    Returns:
+        dict: 处理后的 data_dict，其中 'complete' 已被下采样。
+    """
+    if 'complete' not in data_dict:
+        return data_dict
+
+    complete_sequence = data_dict['complete'] # List[N_frames] of np.ndarray (P_i, 3)
+    filtered_complete_sequence = []
+
+    for points in complete_sequence:
+        if len(points) == 0:
+            filtered_complete_sequence.append(points)
+            continue
+            
+        # Open3D 体素滤波
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
+        points_down = np.asarray(pcd_down.points)
+        filtered_complete_sequence.append(points_down)
+
+    data_dict['complete'] = filtered_complete_sequence
+    
+    return data_dict
+
+
+###############################################################################
+# Preprocess functions
+###############################################################################
+
+
+###############################################################################
 # Utility classes
 ###############################################################################
 
 # 自定义数据集类
 class ConstructTerrainDataset(torch.utils.data.Dataset):
-    def __init__(self, phase="train", type=None, transform=None, config=None):
-        """
-        构造函数：按照给定的训练模式，加载全部时序样本的路径列表，并排序
-        """
+    def __init__(self, phase="train", type=None, config=None, device='cpu', augment_data=False, transforms=None):
         self.phase = phase                      # "train", "test"
         self.type = type                        # "walk", ...
-        self.transform = transform              # 预处理函数
+        self.augment_data = augment_data        # 是否启用数据增强
+        self.transforms = transforms            # 预处理函数
         self.resolution = config.resolution     # 体素分辨率
         self.samples = []                       # 存储配对好的样本信息
         self.cache = {}                         # 样本加载缓存
         self.last_cache_percent = 0             # 样本缓存比例
-        self.force_norm = config.force_norm     # 强制归一化
+        self.device = device
         self.cache_use = config.cache_use
         
         # 修改根目录路径以适应新数据集结构
@@ -495,11 +540,11 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
                     {
                         'type': current_type,
                         'seq_idx': seq_idx_s,
-                        'partial_paths': p_fnames,          # 明确表明存储的是文件路径列表
-                        'complete_paths': c_fnames,         # 明确表明存储的是文件路径列表
-                        'transform_path': transform_path,   # 添加变换文件路径
-                        'pos_data': pos_data,               # 位置数据
-                        'quat_data': quat_data,             # 姿态数据
+                        'partial_paths': p_fnames,          
+                        'complete_paths': c_fnames,         
+                        'transform_path': transform_path,   
+                        'pos_data': pos_data,               
+                        'quat_data': quat_data,             
                     }
                 )
         
@@ -512,7 +557,7 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
     
-    def _load_pcd_sequence(self, pcd_paths):
+    def _load_pcd_sequence(self, pcd_paths, device):
         """
         辅助函数：加载一组 PCD 文件路径，处理并合并为一个样本列表
         """
@@ -575,19 +620,20 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
-        device = sample_info['device']
+
         data_dict = {
             'type': sample_info['type'],
             'seq_idx': sample_info['seq_idx'],
             'num_frames': len(sample_info['partial_paths']),
-            'partial': self._load_pcd_sequence(sample_info['partial_paths'], self.force_norm, device),
-            'complete': self._load_pcd_sequence(sample_info['complete_paths'], self.force_norm, device),
+            'partial': self._load_pcd_sequence(sample_info['partial_paths'], self.device),
+            'complete': self._load_pcd_sequence(sample_info['complete_paths'], self.device),
             'pos_data': sample_info['pos_data'],
             'quat_data': sample_info['quat_data'],
         }
 
-        if self.transform:
-            data_dict = self.transform(data_dict)
+        if self.augment_data:
+            for t in self.transforms:
+                data_dict = t(data_dict)
         
         return data_dict
 
@@ -920,7 +966,7 @@ class LidarCompletionNet(nn.Module):
 
     # Forward Method
     def forward(self, sin_fused, target_key=None):
-        out_cls, targets = []
+        out_cls, targets = [], []
 
         if self.training:
             assert target_key is not None, "Target Key is required for training to generate labels."
@@ -1021,9 +1067,14 @@ class LidarCompletionNet(nn.Module):
         sout = self.dec_block_s1(dec_s1)
 
         # Store last occupancy probability and coordinates for next step
-        occ_prob = torch.sigmoid(dec_s1_cls.F.squeeze()).detach()
+        target_coords = sout.C              # Shape: [N_out, 4] (batch_idx, x, y, z)
+        source_coords = dec_s1_cls.C        # Shape: [N_cls, 4]
+        target_keys = target_coords[:, 0] * 1000000 + target_coords[:, 1] * 10000 + target_coords[:, 2] * 100 + target_coords[:, 3]
+        source_keys = source_coords[:, 0] * 1000000 + source_coords[:, 1] * 10000 + source_coords[:, 2] * 100 + source_coords[:, 3]
+        mask = torch.isin(source_keys, target_keys)
+        selected_probs = dec_s1_cls.F[mask].squeeze()
+        occ_prob = torch.sigmoid(selected_probs).detach()
 
-        # predict voxels, gt voxels, output pc(coords + feats) 
         return out_cls, targets, sout, occ_prob
 
 
@@ -1043,208 +1094,165 @@ def train(net, dataloader, device, config):
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
     print(f"📝 TensorBoard logs saved to: {run_log_dir}")
-    
-    # 初始化 SGD 优化器
+
+    # 初始化优化器和损失函数
     optimizer = optim.AdamW(
         net.parameters(),
-        lr=config.lr,                    
-        weight_decay=config.weight_decay,          
-        betas=(0.9, 0.995),         
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=(0.9, 0.995),
     )
-
-    # 初始化损失函数
     crit1 = ChamferDistanceLoss().to(device)
     crit2 = nn.BCEWithLogitsLoss()
-
-    # 网络切换到训练模式
-    net.train()
     
-    # 获取数据载入器的迭代器
+    net.train()
     train_iter = iter(dataloader)
     
-    # 记录初始学习率
-    current_lr = optimizer.param_groups[0]['lr']
-    logging.info(f"LR: {current_lr}")
-    writer.add_scalar('Params/LR', current_lr, 0)
+    alpha = config.alpha
+    beta = 1.0 - alpha
     
-    # 双损失复合加权系数
-    alpha = config.alpha    # 分类损失权重
-    beta = 1.0 - alpha      # 回归损失权重
-    
-    # 初始化计数参数
-    train_steps = 0         # 总训练步数
-    data_time = 0           # 单次迭代的数据加载耗时
-    total_time = 0          # 单次迭代的总耗时
-    
-    # 训练周期循环
-    last_occupancy_probs = [None] * config.batch_size
-    last_points_norm_list = [None] * config.batch_size
+    train_steps = 0
+    data_time = 0
+    total_time = 0
+
+    prev_frame_data = [None] * config.batch_size 
     for i in range(config.max_iter):
-        # 获取小批量训练数据
         start_time = time()
         data_dict = next(train_iter)
         data_time = time() - start_time
         writer.add_scalar('Time/Iter_Data_Time', data_time, i)
-        
-        # 记录本次 iter 内各 step 的 loss 数值
+
         step_total_losses = []
         step_cls_losses = []
         step_reg_losses = []
 
-        # 清除梯度
         optimizer.zero_grad()
-        
-        # 按照时序遍历
-        num_frames = data_dict['num_frames']    
+
+        num_frames = data_dict['num_frames']
         for t in range(num_frames):
-            # 获取原始点云序列 (List[np.ndarray])
+            # 数据加载与转换
             t_p_points_list_np = data_dict['partial'][t]
             t_c_points_list_np = data_dict['complete'][t]
-            # 获取变换数据
             t_pos_data_list_np = data_dict['pos_data'][t]
             t_quat_data_list_np = data_dict['quat_data'][t]
             _t_pos_data_list_np = data_dict['pos_data'][(t - 1) if t != 0 else 0]
             _t_quat_data_list_np = data_dict['quat_data'][(t - 1) if t != 0 else 0]
-            # 将 Numpy List 转换为 Torch List
-            t_p_points_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_p_points_list_np
-            ]
-            t_c_points_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_c_points_list_np
-            ]
-            t_pos_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_pos_data_list_np
-            ]
-            t_quat_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_quat_data_list_np
-            ]
-            _t_pos_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in _t_pos_data_list_np
-            ]
-            _t_quat_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in _t_quat_data_list_np
-            ]
-            # 体素坐标量化，List[np.ndarray]
-            _, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
-            _, _, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+
+            t_p_points_list = [torch.from_numpy(p).float().to(device) for p in t_p_points_list_np]
+            t_c_points_list = [torch.from_numpy(p).float().to(device) for p in t_c_points_list_np]
+            t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in t_pos_data_list_np]
+            t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in t_quat_data_list_np]
+            _t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in _t_pos_data_list_np]
+            _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
+
+            # 体素化当前帧
+            _, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
+            _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
             t_c_coords_float_list = [pc * config.resolution for pc in t_c_points_list]
+            # 处理当前帧特征
+            curr_feats_list = compute_feats(
+                coords_float_list=t_p_coords_float_list,
+                coords_voxel_list=t_p_coords_voxel_list,
+                time_encoding=0.0,
+                prob=1.0
+            )
             
-            # Prepare fused coordinates and features
             all_input_coords = []
             all_input_feats = []
-            # Process History (if exists)
-            if t > 0:
-                # Transform last points to current frame's view and clip
-                hist_points_norm_list = points_transform_and_normclip(
-                    last_points_norm_list, # This is from previous time step's sout_points_norm_list
-                    torch.stack(t_pos_data_list), 
-                    torch.stack(t_quat_data_list), 
-                    torch.stack(_t_pos_data_list), 
-                    torch.stack(_t_quat_data_list), 
-                    scale=3.2, bound=0.5
-                )
-                if hist_points_norm_list and any(len(pts) > 0 for pts in hist_points_norm_list):
-                    _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
-                    hist_feats_list = compute_feats(
-                        hist_coords_float_list, 
-                        hist_coords_voxel_list, 
-                        time_encoding=1.0,          # Hist time encoding is 1
-                        prob_values=last_occupancy_probs # Use probs from previous step
-                    )
-                    all_input_coords.extend(hist_coords_voxel_list)
-                    all_input_feats.extend(hist_feats_list)
-            
-            # Process Current Frame (high priority)
-            curr_feats_list = compute_feats(
-                t_p_coords_float_list, 
-                t_p_coords_voxel_list, 
-                time_encoding=0.0,          # Curr time encoding is 0
-                prob_values=None            # Default prob is 1.0
-            )
             all_input_coords.extend(t_p_coords_voxel_list)
             all_input_feats.extend(curr_feats_list)
-            
-            # Create fused sparse tensor using collate
-            batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
-            # Aggregate ground truth coordinates
-            batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
-            
-            # Create fused input tensor
-            sin_fused = ME.SparseTensor(
-                features=batched_input_feats,
-                coordinates=batched_input_coords,
-                device=device,
-            )
-            # Create target key
-            cm = sin_fused.coordinate_manager
-            in_target_key, _ = cm.insert_and_map(
-                coordinates=batched_gt_coords,
-                string_id="target",
-            )
 
-            # Forward
-            out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
+            # 处理历史数据
+            if t > 0:
+                prev_points_list = [data[0] for data in prev_frame_data if data is not None]
+                prev_feats_list = [data[1] for data in prev_frame_data if data is not None]
+
+                transformed_points_list, transformed_feats_list = points_transform_and_normclip(
+                    points_prev_list=prev_points_list,
+                    pos_curr=torch.stack(t_pos_data_list),
+                    quat_curr=torch.stack(t_quat_data_list),
+                    pos_prev=torch.stack(_t_pos_data_list),
+                    quat_prev=torch.stack(_t_quat_data_list),
+                    feats_prev_list=prev_feats_list,
+                    scale=3.2,
+                    bound=0.5
+                )
+                _, _, hist_voxel_list, temp_feats_list = voxelization(transformed_points_list, config.resolution, transformed_feats_list) 
+                
+                hist_feats_list = []
+                for feats in temp_feats_list:
+                    new_time_col = torch.ones((feats.shape[0], 1), device=feats.device)
+                    new_feats = torch.cat([feats[:, :3], new_time_col, feats[:, -1:]], dim=1)
+                    hist_feats_list.append(new_feats)
+                    
+                for batch_idx in range(config.batch_size):
+                    all_input_coords[batch_idx] = torch.cat([all_input_coords[batch_idx], hist_voxel_list[batch_idx]], dim=0)
+                    all_input_feats[batch_idx] = torch.cat([all_input_feats[batch_idx], hist_feats_list[batch_idx]], dim=0)
+
+            # 构建稀疏张量
+            batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
+            batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
+
+            sin_fused = ME.SparseTensor(features=batched_input_feats, coordinates=batched_input_coords, device=device)
             
-            # Reconstruct points for loss calculation and saving for next step
+            cm = sin_fused.coordinate_manager
+            in_target_key, _ = cm.insert_and_map(coordinates=batched_gt_coords, string_id="target")
+
+            # 前向传播
+            out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
+
+            # 后处理与 Loss 计算 (保持不变)
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
             detached_sout_coords_list = [coords.detach() for coords in sout_coords_list]
             detached_sout_feats_list = [feats.detach() for feats in sout_feats_list]
             sout_points_norm_list, sout_points_float_list = devoxelization(detached_sout_coords_list, detached_sout_feats_list, res=config.resolution)
-        
-            # Calculate Chamfer Distance Loss
-            num_batches, batch_chamfer_loss = len(t_c_coords_float_list), 0
+
+            # 切分 occ_prob 并构建特征
+            num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+            occ_prob_list = torch.split(occ_prob.detach(), num_points_list)
+            temp_feats_list = []
+            for feats, prob in zip(detached_sout_feats_list, occ_prob_list):
+                temp_feats_list.append(torch.cat([feats, prob.unsqueeze(1)], dim=1))
+            prev_frame_data = [(coords, feats) for coords, feats in zip(sout_points_norm_list, temp_feats_list)]
+
+            # Chamfer Distance Loss
+            batch_chamfer_loss = 0
             for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_points_float_list):
                 batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
-            points_reg_loss = batch_chamfer_loss / num_batches
+            points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
             step_reg_losses.append(points_reg_loss.item())
 
-            # Calculate voxel cross-entropy loss
-            num_layers, batch_bce_loss = len(out_cls), 0
+            # Voxel BCE Loss
+            batch_bce_loss = 0
             layer_losses = []
             for out_cl, out_target in zip(out_cls, out_targets):
                 curr_layer_loss = crit2(out_cl.F.squeeze(), out_target.type(out_cl.F.dtype).to(device))
                 layer_losses.append(curr_layer_loss.item())
                 batch_bce_loss += curr_layer_loss
-            voxel_cls_loss = batch_bce_loss / num_layers
+            voxel_cls_loss = batch_bce_loss / len(out_cls)
             step_cls_losses.append(voxel_cls_loss.item())
-            
-            # Calculate total loss
-            train_steps += 1
+
+            # 总 Loss
             total_loss = alpha * voxel_cls_loss + beta * points_reg_loss
-            
-            # Backward pass and optimization
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=config.max_norm)
             optimizer.step()
 
-            # Record losses
+            # 记录 Loss
+            train_steps += 1
             step_total_losses.append(total_loss.item())
             writer.add_scalar('Loss/Total_Step_Loss', total_loss.item(), train_steps)
             writer.add_scalar('Loss/Points_Reg_Loss', points_reg_loss.item(), train_steps)
             writer.add_scalar('Loss/Voxel_Cls_Loss', voxel_cls_loss.item(), train_steps)
             for layer_idx, loss_val in enumerate(layer_losses):
                 writer.add_scalar(f'Loss/Layer{layer_idx+1}_Cls_Loss', loss_val, train_steps)
-                
-            # Update last occupancy probabilities and points for next step
-            last_occupancy_probs = [occ_prob]
-            last_points_norm_list = sout_points_norm_list
 
-        # Calculate and record iteration metrics
+        # 迭代结束统计
         total_time = time() - start_time
-        iter_loss = sum(step_total_losses)/len(step_total_losses)
+        iter_loss = sum(step_total_losses) / len(step_total_losses)
         writer.add_scalar('Time/Iter_Total_Time', total_time, i)
         writer.add_scalar('Loss/Iter_Loss', iter_loss, i)
-        # Record learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-        writer.add_scalar('Params/LR', current_lr, i)
-        
-        # Print training info
+
         if i % config.stat_freq_iter == 0:
             steps_total_losses_str = ", ".join([f"{v:.3e}" for v in step_total_losses])
             step_cls_losses_str = ", ".join([f"{v:.3e}" for v in step_cls_losses])
@@ -1256,20 +1264,15 @@ def train(net, dataloader, device, config):
                 f"Step Reg Losses: [{step_reg_losses_str}]\n"
             )
 
-        # Save model and checkpoints
         if i % config.save_freq_iter == 0 and i > 0:
             model_save_path = os.path.join(config.save_dir, config.model_name)
             os.makedirs(model_save_path, exist_ok=True)
             model_save_file = os.path.join(model_save_path, f"model_{i}.pth")
-            torch.save(
-                {
-                    "state_dict": net.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "curr_iter": i,
-                },
-                model_save_file,
-            )
-            # Switch training mode back
+            torch.save({
+                "state_dict": net.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "curr_iter": i,
+            }, model_save_file)
             net.train()
 
 
@@ -1284,206 +1287,149 @@ def train(net, dataloader, device, config):
 
 # 可视化展现函数
 def visualize(net, dataloader, device, config):
-    """
-    需要设定小批量数据 batch_size=1，以便时序性观察
-    切换 shuffle 标志位，选择顺序或随机取样
-    """
-    # 获取数据载入器的迭代器
     train_iter = iter(dataloader)
-    
-    # 网络切换评估模式
     net.eval()
     
-    # 初始化损失函数
     crit1 = ChamferDistanceLoss().to(device)
     crit2 = nn.BCEWithLogitsLoss()
     
-    # 双损失复合加权系数
-    alpha = config.alpha    # 分类损失权重
-    beta = 1.0 - alpha      # 回归损失权重
+    alpha = config.alpha
+    beta = 1.0 - alpha
     
     print("🔍 可视化布局说明:")
-    print("  红: 当前 | 蓝: 历史")
-    print("  黄: 真值 | 绿: 输出")
+    print(" 红: 当前 | 蓝: 历史")
+    print(" 黄: 真值 | 绿: 输出")
 
-    # Initialize last occupancy probabilities for each batch item
-    last_occupancy_probs = [None] * 1 # batch_size is 1
-    last_points_norm_list = [None] * 1
-
-    # 顺序遍历数据加载器，获取小批量样本
+    # 初始化状态
+    prev_frame_data = [None] * 1 
+    temp_feats_list = []
     for i in range(config.max_visualization):
-        # 获取样本
         data_dict = next(train_iter)
-        
-        # 批次维度应当为1
-        assert len(data_dict['partial'][0]) == 1, "Error: Dataloader batch_size in Visualize(eval mode) should equal to 1 !!!"
-        
-        # 记录本次 iter 内各 step 的 loss 数值
-        step_total_losses = []
-        step_cls_losses = []
-        step_reg_losses = []
-        
-        # 按照时序遍历
+        assert len(data_dict['partial'][0]) == 1, "Error: batch_size should be 1"
+
         num_frames = data_dict['num_frames']
         for t in range(num_frames):
-            # 获取原始点云序列 (List[np.ndarray])
+            # 数据加载 (与 train 类似，保持不变)
             t_p_points_list_np = data_dict['partial'][t]
             t_c_points_list_np = data_dict['complete'][t]
-            # 获取变换数据
             t_pos_data_list_np = data_dict['pos_data'][t]
             t_quat_data_list_np = data_dict['quat_data'][t]
             _t_pos_data_list_np = data_dict['pos_data'][(t - 1) if t != 0 else 0]
             _t_quat_data_list_np = data_dict['quat_data'][(t - 1) if t != 0 else 0]
-            # 将 Numpy List 转换为 Torch List
-            t_p_points_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_p_points_list_np
-            ]
-            t_c_points_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_c_points_list_np
-            ]
-            t_pos_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_pos_data_list_np
-            ]
-            t_quat_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in t_quat_data_list_np
-            ]
-            _t_pos_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in _t_pos_data_list_np
-            ]
-            _t_quat_data_list = [
-                torch.from_numpy(p).float().to(device) 
-                for p in _t_quat_data_list_np
-            ]
-            # 体素坐标量化，List[np.ndarray]
-            t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list = voxelization(t_p_points_list, config.resolution)
-            _, _, t_c_coords_voxel_list = voxelization(t_c_points_list, config.resolution)
+
+            t_p_points_list = [torch.from_numpy(p).float().to(device) for p in t_p_points_list_np]
+            t_c_points_list = [torch.from_numpy(p).float().to(device) for p in t_c_points_list_np]
+            t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in t_pos_data_list_np]
+            t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in t_quat_data_list_np]
+            _t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in _t_pos_data_list_np]
+            _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
+
+            t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
+            _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
             t_c_coords_float_list = [pc * config.resolution for pc in t_c_points_list]
+            curr_feats_list = compute_feats(
+                coords_float_list=t_p_coords_float_list,
+                coords_voxel_list=t_p_coords_voxel_list,
+                time_encoding=0.0,
+                prob=1.0
+            )
             
-            # Prepare fused coordinates and features
             all_input_coords = []
             all_input_feats = []
-            # Process History (if exists)
-            if t > 0:
-                # Transform last points to current frame's view and clip
-                hist_points_norm_list = points_transform_and_normclip(
-                    last_points_norm_list, # This is from previous time step's sout_points_norm_list
-                    torch.stack(t_pos_data_list), 
-                    torch.stack(t_quat_data_list), 
-                    torch.stack(_t_pos_data_list), 
-                    torch.stack(_t_quat_data_list), 
-                    scale=3.2, bound=0.5
-                )
-                if hist_points_norm_list and any(len(pts) > 0 for pts in hist_points_norm_list):
-                    _, hist_coords_float_list, hist_coords_voxel_list = voxelization(hist_points_norm_list, config.resolution)
-                    hist_feats_list = compute_feats(
-                        hist_coords_float_list, 
-                        hist_coords_voxel_list, 
-                        time_encoding=1.0,          # Hist time encoding is 1
-                        prob_values=last_occupancy_probs # Use probs from previous step
-                    )
-                    all_input_coords.extend(hist_coords_voxel_list)
-                    all_input_feats.extend(hist_feats_list)
-            
-            # Process Current Frame (high priority)
-            curr_feats_list = compute_feats(
-                t_p_coords_float_list, 
-                t_p_coords_voxel_list, 
-                time_encoding=0.0,          # Curr time encoding is 0
-                prob_values=None            # Default prob is 1.0
-            )
             all_input_coords.extend(t_p_coords_voxel_list)
             all_input_feats.extend(curr_feats_list)
-            
-            # Create fused sparse tensor using collate
-            batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
-            # Aggregate ground truth coordinates
-            batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
-            
-            # Create fused input tensor
-            sin_fused = ME.SparseTensor(
-                features=batched_input_feats,
-                coordinates=batched_input_coords,
-                device=device,
-            )
-            # Create target key
-            cm = sin_fused.coordinate_manager
-            in_target_key, _ = cm.insert_and_map(
-                coordinates=batched_gt_coords,
-                string_id="target",
-            )
 
-            # Forward
-            out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
+            # 处理历史数据
+            if t > 0:
+                prev_points_list = [data[0] for data in prev_frame_data if data is not None]
+                prev_feats_list = [data[1] for data in prev_frame_data if data is not None]
+
+                transformed_points_list, transformed_feats_list = points_transform_and_normclip(
+                    points_prev_list=prev_points_list,
+                    pos_curr=torch.stack(t_pos_data_list),
+                    quat_curr=torch.stack(t_quat_data_list),
+                    pos_prev=torch.stack(_t_pos_data_list),
+                    quat_prev=torch.stack(_t_quat_data_list),
+                    feats_prev_list=prev_feats_list,
+                    scale=3.2,
+                    bound=0.5
+                )
+                _, _, hist_voxel_list, temp_feats_list = voxelization(transformed_points_list, config.resolution, transformed_feats_list) 
+                
+                hist_feats_list = []
+                for feats in temp_feats_list:
+                    new_time_col = torch.ones((feats.shape[0], 1), device=feats.device)
+                    new_feats = torch.cat([feats[:, :3], new_time_col, feats[:, -1:]], dim=1)
+                    hist_feats_list.append(new_feats)
+                    
+                for batch_idx in range(1):
+                    all_input_coords[batch_idx] = torch.cat([all_input_coords[batch_idx], hist_voxel_list[batch_idx]], dim=0)
+                    all_input_feats[batch_idx] = torch.cat([all_input_feats[batch_idx], hist_feats_list[batch_idx]], dim=0)
+
+            # 构建 Tensor
+            batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
+            batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
+
+            sin_fused = ME.SparseTensor(features=batched_input_feats, coordinates=batched_input_coords, device=device)
             
-            # Reconstruct points for loss calculation and saving for next step
+            cm = sin_fused.coordinate_manager
+            in_target_key, _ = cm.insert_and_map(coordinates=batched_gt_coords, string_id="target")
+
+            # 前向传播
+            with torch.no_grad():
+                out_cls, out_targets, sout, occ_prob = net(sin_fused, in_target_key)
+
+            # 后处理
             sout_coords_list, sout_feats_list = sout.decomposed_coordinates_and_features
             detached_sout_coords_list = [coords.detach() for coords in sout_coords_list]
             detached_sout_feats_list = [feats.detach() for feats in sout_feats_list]
             sout_points_norm_list, sout_points_float_list = devoxelization(detached_sout_coords_list, detached_sout_feats_list, res=config.resolution)
+            
+            # 切分 occ_prob 并构建特征
+            num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+            occ_prob_list = torch.split(occ_prob, num_points_list)
+            temp_feats_list = []
+            for feats, prob in zip(detached_sout_feats_list, occ_prob_list):
+                temp_feats_list.append(torch.cat([feats, prob.unsqueeze(1)], dim=1))
+            prev_frame_data = [(coords.detach(), feats.detach()) for coords, feats in zip(sout_points_norm_list, temp_feats_list)]
 
-            # Calculate Chamfer Distance Loss
-            num_batches, batch_chamfer_loss = len(t_c_coords_float_list), 0
+            # Loss 计算 (用于打印)
+            batch_chamfer_loss = 0
             for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_points_float_list):
                 batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
-            points_reg_loss = batch_chamfer_loss / num_batches
-            step_reg_losses.append(points_reg_loss.item())
+            points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
 
-            # Calculate voxel cross-entropy loss
-            num_layers, batch_bce_loss = len(out_cls), 0
+            batch_bce_loss = 0
             layer_losses = []
             for out_cl, out_target in zip(out_cls, out_targets):
                 curr_layer_loss = crit2(out_cl.F.squeeze(), out_target.type(out_cl.F.dtype).to(device))
                 layer_losses.append(curr_layer_loss.item())
                 batch_bce_loss += curr_layer_loss
-            voxel_cls_loss = batch_bce_loss / num_layers
-            step_cls_losses.append(voxel_cls_loss.item())
-            
-            # Calculate total loss
+            voxel_cls_loss = batch_bce_loss / len(out_cls)
+
             total_loss = alpha * voxel_cls_loss + beta * points_reg_loss
+
             print(f"points_reg_loss: {points_reg_loss}")
             print(f"voxel_cls_loss: {voxel_cls_loss}")
             print(f"layer_losses: {layer_losses}")
             print(f"total_loss: {total_loss}\n")
 
-            # Update last occupancy probabilities and points for next step
-            last_occupancy_probs = [occ_prob]
-            last_points_norm_list = sout_points_norm_list
-
-            # Get point clouds for visualization
-            sin_curr_pc = t_p_points_norm_list[0].cpu().numpy()
-            # For history, use transformed last output
-            if t > 0 and last_points_norm_list[0] is not None:
-                sin_hist_pc = hist_points_norm_list[0].cpu().numpy()
+            # 可视化 
+            sin_curr_pc = t_p_points_norm_list[0].cpu().numpy() if t_p_points_norm_list[0].size(0) > 0 else np.empty((0, 3))
+            if t > 0 and prev_frame_data[0] is not None:
+                hist_coords, _ = prev_frame_data[0]
+                sin_hist_pc = hist_coords.cpu().numpy()
             else:
-                sin_hist_pc = np.empty((0, 3)) # Empty if first frame
-            # gt
+                sin_hist_pc = np.empty((0, 3))
             gt_pc = t_c_points_list[0].cpu().numpy()
-            # sout
             sout_pc = sout_points_norm_list[0].cpu().numpy()
-            
-            # visualization, Ensure no empty arrays cause issues
-            if sin_curr_pc.size > 0:
-                sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-1.0, -1.0, 0], rotate_matrix=M)
-            else:
-                sin_curr_pcd = o3d.geometry.PointCloud()
-            if sin_hist_pc.size > 0:
-                sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[1.0, -1.0, 0], rotate_matrix=M)
-            else:
-                sin_hist_pcd = o3d.geometry.PointCloud()
-            if gt_pc.size > 0:
-                gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-1.0, 1.0, 0], rotate_matrix=M)
-            else:
-                gt_pcd = o3d.geometry.PointCloud()
-            if sout_pc.size > 0:
-                sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[1.0, 1.0, 0], rotate_matrix=M)
-            else:
-                sout_pcd = o3d.geometry.PointCloud()
-            
+
+            # 创建点云对象
+            sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-1.0, -1.0, 0], rotate_matrix=M) if sin_curr_pc.size > 0 else o3d.geometry.PointCloud()
+            sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[1.0, -1.0, 0], rotate_matrix=M) if sin_hist_pc.size > 0 else o3d.geometry.PointCloud()
+            gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-1.0, 1.0, 0], rotate_matrix=M) if gt_pc.size > 0 else o3d.geometry.PointCloud()
+            sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[1.0, 1.0, 0], rotate_matrix=M) if sout_pc.size > 0 else o3d.geometry.PointCloud()
+
             o3d.visualization.draw_geometries([sin_curr_pcd, sin_hist_pcd, gt_pcd, sout_pcd])
 
 
@@ -1521,12 +1467,14 @@ if __name__ == "__main__":
     if not config.eval:
         dataloader = make_data_loader(
             phase="train",
-            augment_data=True,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
             repeat=True,
             config=config,
+            device='cpu',
+            augment_data=True,
+            transforms=[lambda x: VoxelFilterTransform(x, voxel_size=0.015)]
         )
         
         train(net, dataloader, device, config)
@@ -1556,12 +1504,14 @@ if __name__ == "__main__":
 
         dataloader = make_data_loader(
             phase="train",
-            augment_data=True,
             batch_size=1,
             shuffle=True,
             num_workers=0,
             repeat=True,
             config=config,
+            device='cpu',
+            augment_data=True,
+            transforms=[lambda x: VoxelFilterTransform(x, voxel_size=0.015)]
         )
 
         visualize(net, dataloader, device, config)
