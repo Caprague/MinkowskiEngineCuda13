@@ -579,10 +579,8 @@ def train(net, dataloader, device, config):
                 },
                 config.weights,
             )
-
             scheduler.step()
             logging.info(f"LR: {scheduler.get_lr()}")
-
             net.train()
 
 
