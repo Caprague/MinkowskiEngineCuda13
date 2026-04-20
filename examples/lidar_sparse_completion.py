@@ -48,15 +48,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 import MinkowskiEngine as ME
 
-# 可视化时，点云的旋转矩阵，方便正面查看物体状态
-M = np.array(
-    [
-        [0.80656762, -0.5868724, -0.07091862],
-        [0.3770505, 0.418344, 0.82632997],
-        [-0.45528188, -0.6932309, 0.55870326],
-    ]
-)
-
 assert (
     int(o3d.__version__.split(".")[1]) >= 8
 ), f"Requires open3d version >= 0.8, the current version is {o3d.__version__}"
@@ -89,9 +80,10 @@ parser.add_argument("--num_workers",        type=int,                   default=
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v8")
-parser.add_argument("--load_optimizer",     type=str,                   default="true")
+parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=True)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
+parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
 PURNING_THRESHOLD = 0.0
@@ -867,6 +859,251 @@ class ChamferDistanceLoss(nn.Module):
         return loss
 
 
+class Visualizer:
+    def __init__(self, net, dataloader, device, config):
+        self.train_iter = iter(dataloader)
+        self.net = net
+        self.net.eval()
+        
+        self.crit1 = ChamferDistanceLoss().to(device)
+        self.crit2 = nn.BCEWithLogitsLoss()
+        
+        self.alpha = config.alpha
+        self.beta = config.beta
+        
+        self.M = np.eye(3)
+        
+        self.max_visualization = config.max_visualization
+        self.prev_frame_data = [None] * 1 
+        self.curr_sample_idx = 0
+        self.curr_frame_idx = 0
+        self.num_frames = 0
+        self.cnt_frames = 0
+        self.data_dict = {}
+        self.is_first_frame = True
+        self.is_running = True # 控制主循环的标志
+        self.last_next_time = time()
+        
+        print("🔍 可视化布局说明:")
+        print(" 红: 当前 | 蓝: 历史")
+        print(" 黄: 真值 | 绿: 输出")
+        
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window(window_name="Main Viewer", width=1200, height=800, left=0, top=0)
+        opt = self.vis.get_render_option()
+        opt.background_color = np.asarray([0, 0, 0]) # 黑色背景
+        opt.point_size = 2.0
+        
+        self.sin_curr_pcd = o3d.geometry.PointCloud()
+        self.sin_hist_pcd = o3d.geometry.PointCloud()
+        self.gt_pcd = o3d.geometry.PointCloud()
+        self.sout_pcd = o3d.geometry.PointCloud()
+        self.vis.add_geometry(self.sin_curr_pcd)
+        self.vis.add_geometry(self.sin_hist_pcd)
+        self.vis.add_geometry(self.gt_pcd)
+        self.vis.add_geometry(self.sout_pcd)
+        
+        self.vis.register_key_callback(ord("N"), self.render_sample)
+        self.vis.register_key_callback(ord("P"), self.prev_sample)        
+        self.vis.register_key_callback(ord("R"), self.reset_visualization)
+        self.vis.register_key_callback(ord("Q"), self.close)
+        
+    def visualize(self):
+        print("\n[N] 下一帧 | [P] 上一帧 | [R] 重置 | [Q] 退出\n")
+        self.render_sample(None)
+        while self.is_running:
+            self.vis.poll_events()
+            self.vis.update_renderer()
+        self.vis.destroy_window()
+
+    def close(self, vis):
+        self.is_running = False
+
+    def prev_sample(self, vis):
+        if abs(time() - self.last_next_time) < 0.02:
+            return
+        self.curr_frame_idx -= 1
+        if self.curr_frame_idx < 0:
+            self.curr_frame_idx = 0
+            print("已经是第一帧了")
+            return
+
+        if self.data_dict is not None:
+            print(f"Visualize sample {self.curr_sample_idx + 1}/{self.max_visualization} frame {self.curr_frame_idx + 1}/{self.num_frames}")
+            self.render_frame(self.data_dict, self.curr_frame_idx)
+            
+        self.last_next_time = time()
+
+    def reset_visualization(self, vis):
+        if abs(time() - self.last_next_time) < 0.02:
+            return
+        self.curr_frame_idx = 0 
+        if self.data_dict is not None:
+            print(f"Visualize sample {self.curr_sample_idx + 1}/{self.max_visualization} frame {self.curr_frame_idx + 1}/{self.num_frames}")
+            self.render_frame(self.data_dict, self.curr_frame_idx)
+        self.vis.reset_view_point(True)
+        self.last_next_time = time()
+
+    def render_sample(self, vis):
+        if abs(time() - self.last_next_time) < 0.02:
+            return
+        
+        if self.is_first_frame:
+            self.data_dict = next(self.train_iter)
+            assert len(self.data_dict['partial'][0]) == 1, "Error: batch_size should be 1"
+            self.num_frames = self.data_dict['num_frames']
+            self.curr_frame_idx = 0
+            self.is_first_frame = False
+            
+        print(f"Visualize sample {self.curr_sample_idx + 1}/{self.max_visualization} frame {self.curr_frame_idx + 1}/{self.num_frames}")
+        self.render_frame(self.data_dict, self.curr_frame_idx)
+        
+        if self.cnt_frames == 0:
+            self.vis.reset_view_point(True)
+            
+        self.curr_frame_idx += 1
+        self.cnt_frames += 1
+        
+        if self.curr_frame_idx >= self.num_frames:
+            self.curr_sample_idx += 1
+            self.is_first_frame = True
+            
+        if self.curr_sample_idx >= self.max_visualization:
+            self.is_running = False
+            
+        self.last_next_time = time()
+            
+    def render_frame(self, data_dict, frame_idx):
+        t_p_points_list_np = data_dict['partial'][frame_idx]
+        t_c_points_list_np = data_dict['complete'][frame_idx]
+        t_pos_data_list_np = data_dict['pos_data'][frame_idx]
+        t_quat_data_list_np = data_dict['quat_data'][frame_idx]
+        _t_pos_data_list_np = data_dict['pos_data'][(frame_idx - 1) if frame_idx != 0 else 0]
+        _t_quat_data_list_np = data_dict['quat_data'][(frame_idx - 1) if frame_idx != 0 else 0]
+
+        t_p_points_list = [torch.from_numpy(p).float().to(device) for p in t_p_points_list_np]
+        t_c_points_list = [torch.from_numpy(p).float().to(device) for p in t_c_points_list_np]
+        t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in t_pos_data_list_np]
+        t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in t_quat_data_list_np]
+        _t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in _t_pos_data_list_np]
+        _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
+
+        t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
+        _, t_c_coords_float_list, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
+        curr_feats_list = compute_feats(
+            coords_float_list=t_p_coords_float_list,
+            coords_voxel_list=t_p_coords_voxel_list,
+            time_encoding=0.0,
+            prob=1.0
+        )
+        
+        all_input_coords = []
+        all_input_feats = []
+        all_input_coords.extend(t_p_coords_voxel_list)
+        all_input_feats.extend(curr_feats_list)
+
+        if frame_idx > 0:
+            prev_points_list = [data[0] for data in self.prev_frame_data if data is not None]
+            prev_probs_list = [data[1] for data in self.prev_frame_data if data is not None]
+
+            transformed_points_list, transformed_probs_list = points_transform_and_normclip(
+                points_prev_list=prev_points_list,
+                pos_curr=torch.stack(t_pos_data_list),
+                quat_curr=torch.stack(t_quat_data_list),
+                pos_prev=torch.stack(_t_pos_data_list),
+                quat_prev=torch.stack(_t_quat_data_list),
+                feats_prev_list=prev_probs_list,
+                scale=3.2,
+                bound=0.5
+            )
+            
+            hist_norm_list, hist_float_list, hist_voxel_list, temp_feats_list = voxelization(transformed_points_list, config.resolution, transformed_probs_list) 
+            hist_feats_list = compute_feats(
+                coords_float_list=hist_float_list,
+                coords_voxel_list=hist_voxel_list,
+                time_encoding=1.0,
+                prob=temp_feats_list
+            )
+            
+            all_input_coords[0] = torch.cat([all_input_coords[0], hist_voxel_list[0]], dim=0)
+            all_input_feats[0] = torch.cat([all_input_feats[0], hist_feats_list[0]], dim=0)
+
+        # 构建 Tensor
+        batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
+        batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
+
+        sin_fused = ME.SparseTensor(features=batched_input_feats, coordinates=batched_input_coords, device=device)
+        
+        cm = sin_fused.coordinate_manager
+        in_target_key, _ = cm.insert_and_map(coordinates=batched_gt_coords, string_id="target")
+
+        # 前向传播
+        with torch.no_grad():
+            out_cls, out_targets, sout, occ_probs = self.net(sin_fused, in_target_key)
+
+        # 后处理与 Loss 计算 (保持不变)
+        sout_coords_list, _ = sout.decomposed_coordinates_and_features
+        sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, res=config.resolution)
+
+        # 切分 occ_prob 并构建特征
+        num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+        occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
+        self.prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
+
+        # Chamfer Distance Loss
+        batch_chamfer_loss = 0
+        for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_floats_list):
+            batch_chamfer_loss += self.crit1(pred_tensor, gt_tensor)
+        points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
+
+        # Voxel BCE Loss
+        batch_bce_loss = 0
+        layer_losses = []
+        for out_cl, out_target in zip(out_cls, out_targets):
+            curr_layer_loss = self.crit2(out_cl.F.squeeze(), out_target.type(out_cl.F.dtype).to(device))
+            layer_losses.append(curr_layer_loss.item())
+            batch_bce_loss += curr_layer_loss
+        voxel_cls_loss = batch_bce_loss / len(out_cls)
+
+        # 总 Loss
+        total_loss = self.alpha * voxel_cls_loss + self.beta * points_reg_loss
+        print(f"points_reg_loss: {points_reg_loss}")
+        print(f"voxel_cls_loss: {voxel_cls_loss}")
+        print(f"layer_losses: {layer_losses}")
+        print(f"total_loss: {total_loss}\n")
+
+        # point cloud
+        sin_curr_pc = t_p_points_norm_list[0].cpu().numpy() if t_p_points_norm_list[0].size(0) > 0 else np.empty((0, 3))
+        if frame_idx > 0:
+            sin_hist_pc = hist_norm_list[0].cpu().numpy()
+        else:
+            sin_hist_pc = np.empty((0, 3))
+        gt_pc = t_c_points_list[0].cpu().numpy()
+        sout_pc = sout_points_norm_list[0].cpu().numpy()
+        # open3d point cloud
+        sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-0.5, -0.5, 0], rotate_matrix=self.M) if sin_curr_pc.size > 0 else o3d.geometry.PointCloud()
+        sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[0.5, -0.5, 0], rotate_matrix=self.M) if sin_hist_pc.size > 0 else o3d.geometry.PointCloud()
+        gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-0.5, 0.5, 0], rotate_matrix=self.M) if gt_pc.size > 0 else o3d.geometry.PointCloud()
+        sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[0.5, 0.5, 0], rotate_matrix=self.M) if sout_pc.size > 0 else o3d.geometry.PointCloud()
+        # update render obj
+        self.sin_curr_pcd.points = o3d.utility.Vector3dVector(np.asarray(sin_curr_pcd.points))
+        self.sin_curr_pcd.colors = o3d.utility.Vector3dVector(np.asarray(sin_curr_pcd.colors))
+        self.sin_curr_pcd.normals = o3d.utility.Vector3dVector(np.asarray(sin_curr_pcd.normals))
+        self.sin_hist_pcd.points = o3d.utility.Vector3dVector(np.asarray(sin_hist_pcd.points))
+        self.sin_hist_pcd.colors = o3d.utility.Vector3dVector(np.asarray(sin_hist_pcd.colors))
+        self.sin_hist_pcd.normals = o3d.utility.Vector3dVector(np.asarray(sin_hist_pcd.normals))
+        self.gt_pcd.points = o3d.utility.Vector3dVector(np.asarray(gt_pcd.points))
+        self.gt_pcd.colors = o3d.utility.Vector3dVector(np.asarray(gt_pcd.colors))
+        self.gt_pcd.normals = o3d.utility.Vector3dVector(np.asarray(gt_pcd.normals))
+        self.sout_pcd.points = o3d.utility.Vector3dVector(np.asarray(sout_pcd.points))
+        self.sout_pcd.colors = o3d.utility.Vector3dVector(np.asarray(sout_pcd.colors))
+        self.sout_pcd.normals = o3d.utility.Vector3dVector(np.asarray(sout_pcd.normals))
+        self.vis.update_geometry(self.sin_curr_pcd)
+        self.vis.update_geometry(self.sin_hist_pcd)
+        self.vis.update_geometry(self.gt_pcd)
+        self.vis.update_geometry(self.sout_pcd)
+        
+
 ###############################################################################
 # End of utility classes
 ###############################################################################
@@ -1246,22 +1483,13 @@ class LidarCompletionNet(nn.Module):
 # Train function
 ###############################################################################
 
-def train(net, dataloader, device, config):
+def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device, config):
     # 初始化 SummaryWriter
     timestamp = strftime("%Y%m%d_%H%M%S", localtime())
     run_log_dir = os.path.join(config.log_dir, timestamp)
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
     print(f"📝 TensorBoard logs saved to: {run_log_dir}")
-
-    # 初始化优化器和损失函数
-    optimizer = optim.AdamW(
-        net.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-        betas=(0.9, 0.999),
-    )
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.95)
     
     crit1 = ChamferDistanceLoss().to(device)
     crit2 = nn.BCEWithLogitsLoss().to(device)
@@ -1272,12 +1500,14 @@ def train(net, dataloader, device, config):
     alpha = config.alpha
     beta = config.beta
     
-    train_steps = 0
+    train_steps = start_step
     data_time = 0
     total_time = 0
 
-    prev_frame_data = [None] * config.batch_size 
-    for i in range(config.max_iter):
+    prev_frame_data = [None] * config.batch_size
+    beg_iter = start_iter
+    end_iter = start_iter + config.max_iter
+    for i in range(beg_iter, end_iter):
         start_time = time()
         data_dict = next(train_iter)
         data_time = time() - start_time
@@ -1430,6 +1660,7 @@ def train(net, dataloader, device, config):
                 "state_dict": net.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "curr_iter": i,
+                "curr_step": train_steps,
             }, model_save_file)
             scheduler.step()
             logging.info(f"LR: {scheduler.get_lr()}")
@@ -1448,144 +1679,8 @@ def train(net, dataloader, device, config):
 
 # 可视化展现函数
 def visualize(net, dataloader, device, config):
-    train_iter = iter(dataloader)
-    net.eval()
-    
-    crit1 = ChamferDistanceLoss().to(device)
-    crit2 = nn.BCEWithLogitsLoss()
-    
-    alpha = config.alpha
-    beta = config.beta
-    
-    print("🔍 可视化布局说明:")
-    print(" 红: 当前 | 蓝: 历史")
-    print(" 黄: 真值 | 绿: 输出")
-
-    # 初始化状态
-    prev_frame_data = [None] * 1 
-    for i in range(config.max_visualization):
-        data_dict = next(train_iter)
-        assert len(data_dict['partial'][0]) == 1, "Error: batch_size should be 1"
-
-        num_frames = data_dict['num_frames']
-        for t in range(num_frames):
-            # 数据加载 (与 train 类似，保持不变)
-            t_p_points_list_np = data_dict['partial'][t]
-            t_c_points_list_np = data_dict['complete'][t]
-            t_pos_data_list_np = data_dict['pos_data'][t]
-            t_quat_data_list_np = data_dict['quat_data'][t]
-            _t_pos_data_list_np = data_dict['pos_data'][(t - 1) if t != 0 else 0]
-            _t_quat_data_list_np = data_dict['quat_data'][(t - 1) if t != 0 else 0]
-
-            t_p_points_list = [torch.from_numpy(p).float().to(device) for p in t_p_points_list_np]
-            t_c_points_list = [torch.from_numpy(p).float().to(device) for p in t_c_points_list_np]
-            t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in t_pos_data_list_np]
-            t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in t_quat_data_list_np]
-            _t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in _t_pos_data_list_np]
-            _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
-
-            t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
-            _, t_c_coords_float_list, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
-            curr_feats_list = compute_feats(
-                coords_float_list=t_p_coords_float_list,
-                coords_voxel_list=t_p_coords_voxel_list,
-                time_encoding=0.0,
-                prob=1.0
-            )
-            
-            all_input_coords = []
-            all_input_feats = []
-            all_input_coords.extend(t_p_coords_voxel_list)
-            all_input_feats.extend(curr_feats_list)
-
-            # 处理历史数据
-            if t > 0:
-                prev_points_list = [data[0] for data in prev_frame_data if data is not None]
-                prev_probs_list = [data[1] for data in prev_frame_data if data is not None]
-
-                transformed_points_list, transformed_probs_list = points_transform_and_normclip(
-                    points_prev_list=prev_points_list,
-                    pos_curr=torch.stack(t_pos_data_list),
-                    quat_curr=torch.stack(t_quat_data_list),
-                    pos_prev=torch.stack(_t_pos_data_list),
-                    quat_prev=torch.stack(_t_quat_data_list),
-                    feats_prev_list=prev_probs_list,
-                    scale=3.2,
-                    bound=0.5
-                )
-                
-                hist_norm_list, hist_float_list, hist_voxel_list, temp_feats_list = voxelization(transformed_points_list, config.resolution, transformed_probs_list) 
-                hist_feats_list = compute_feats(
-                    coords_float_list=hist_float_list,
-                    coords_voxel_list=hist_voxel_list,
-                    time_encoding=1.0,
-                    prob=temp_feats_list
-                )
-                
-                all_input_coords[0] = torch.cat([all_input_coords[0], hist_voxel_list[0]], dim=0)
-                all_input_feats[0] = torch.cat([all_input_feats[0], hist_feats_list[0]], dim=0)
-
-            # 构建 Tensor
-            batched_input_coords, batched_input_feats = ME.utils.sparse_collate(all_input_coords, all_input_feats, device=device)
-            batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
-
-            sin_fused = ME.SparseTensor(features=batched_input_feats, coordinates=batched_input_coords, device=device)
-            
-            cm = sin_fused.coordinate_manager
-            in_target_key, _ = cm.insert_and_map(coordinates=batched_gt_coords, string_id="target")
-
-            # 前向传播
-            with torch.no_grad():
-                out_cls, out_targets, sout, occ_probs = net(sin_fused, in_target_key)
-
-            # 后处理与 Loss 计算 (保持不变)
-            sout_coords_list, _ = sout.decomposed_coordinates_and_features
-            sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, res=config.resolution)
-
-            # 切分 occ_prob 并构建特征
-            num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
-            occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
-            prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
-
-            # Chamfer Distance Loss
-            batch_chamfer_loss = 0
-            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_floats_list):
-                batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
-            points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
-
-            # Voxel BCE Loss
-            batch_bce_loss = 0
-            layer_losses = []
-            for out_cl, out_target in zip(out_cls, out_targets):
-                curr_layer_loss = crit2(out_cl.F.squeeze(), out_target.type(out_cl.F.dtype).to(device))
-                layer_losses.append(curr_layer_loss.item())
-                batch_bce_loss += curr_layer_loss
-            voxel_cls_loss = batch_bce_loss / len(out_cls)
-
-            # 总 Loss
-            total_loss = alpha * voxel_cls_loss + beta * points_reg_loss
-
-            print(f"points_reg_loss: {points_reg_loss}")
-            print(f"voxel_cls_loss: {voxel_cls_loss}")
-            print(f"layer_losses: {layer_losses}")
-            print(f"total_loss: {total_loss}\n")
-
-            # 可视化 
-            sin_curr_pc = t_p_points_norm_list[0].cpu().numpy() if t_p_points_norm_list[0].size(0) > 0 else np.empty((0, 3))
-            if t > 0:
-                sin_hist_pc = hist_norm_list[0].cpu().numpy()
-            else:
-                sin_hist_pc = np.empty((0, 3))
-            gt_pc = t_c_points_list[0].cpu().numpy()
-            sout_pc = sout_points_norm_list[0].cpu().numpy()
-
-            # 创建点云对象
-            sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-0.5, -0.5, 0], rotate_matrix=M) if sin_curr_pc.size > 0 else o3d.geometry.PointCloud()
-            sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[0.5, -0.5, 0], rotate_matrix=M) if sin_hist_pc.size > 0 else o3d.geometry.PointCloud()
-            gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-0.5, 0.5, 0], rotate_matrix=M) if gt_pc.size > 0 else o3d.geometry.PointCloud()
-            sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[0.5, 0.5, 0], rotate_matrix=M) if sout_pc.size > 0 else o3d.geometry.PointCloud()
-
-            o3d.visualization.draw_geometries([sin_curr_pcd, sin_hist_pcd, gt_pcd, sout_pcd])
+    vis_tool = Visualizer(net, dataloader, device, config)
+    vis_tool.visualize()
 
 
 ###############################################################################
@@ -1636,31 +1731,80 @@ if __name__ == "__main__":
                 lambda x: RandomNoiseTransform(x, noise_std=0.004),
             ]
         )
+        optimizer = optim.AdamW(
+            net.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.999),
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=config.max_iter, 
+            eta_min=1e-5
+        )
         
-        train(net, dataloader, device, config)
+        start_iter = 0
+        start_step = 0
+        if config.resume:
+            checkpoint_dir = os.path.join(config.save_dir, config.model_name)
+            checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pth"))
+            
+            if not checkpoint_files:
+                logging.warning(f"No checkpoint found in {checkpoint_dir}. Starting from scratch.")
+            else:
+                checkpoint_files.sort()
+                latest_checkpoint = checkpoint_files[-1]
+                logging.info(f"Resuming from latest checkpoint: {latest_checkpoint}")
+                
+                try:
+                    checkpoint = torch.load(latest_checkpoint, map_location=device)
+                    net.load_state_dict(checkpoint["state_dict"])
+                    if config.load_optimizer:
+                        optimizer.load_state_dict(checkpoint["optimizer"])
+                    
+                    filename = os.path.basename(latest_checkpoint)
+                    start_iter = checkpoint["curr_iter"] + 1
+                    start_step = checkpoint["curr_step"] + 1
+                    logging.info(f"Loaded model: {filename}")
+                    logging.info(f"Resuming from iteration {start_iter} (based on saved state)")
+                except Exception as e:
+                    logging.error(f"Failed to load checkpoint: {e}")
+                    logging.info("Starting training from scratch.")
+        
+        train(net, dataloader, optimizer, scheduler, start_iter, start_step, device, config)
         
     else:
         checkpoint_dir_path = os.path.join(config.save_dir, config.model_name)
         if not os.path.exists(checkpoint_dir_path):
-            error_msg = f"Model directory not found at: {checkpoint_dir_path}"
-            logging.error(error_msg)
-            raise FileNotFoundError(error_msg)
+            raise FileNotFoundError(f"Model directory not found at: {checkpoint_dir_path}")
 
-        checkpoint_files = glob.glob(os.path.join(checkpoint_dir_path, "*.pth"))
+        checkpoint_files = glob.glob(os.path.join(checkpoint_dir_path, "model_*.pth"))
         if not checkpoint_files:
-            error_msg = f"No checkpoint files found in {checkpoint_dir_path}."
-            logging.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
-        checkpoint_files.sort(key=lambda x: int(re.search(r'_(\d+)\.pth', os.path.basename(x)).group(1)))
+            raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir_path}.")
+        
+        checkpoint_files.sort() 
         latest_checkpoint_path = checkpoint_files[-1]
-        latest_iter = int(re.search(r'_(\d+)\.pth', os.path.basename(latest_checkpoint_path)).group(1))
-        logging.info(f"Found latest checkpoint: {os.path.basename(latest_checkpoint_path)} (Iter: {latest_iter})")
-        logging.info(f"Loading weights from {latest_checkpoint_path} ...")
+        
+        try:
+            filename = os.path.basename(latest_checkpoint_path)
+            latest_iter = int(filename.split('_')[-1].split('.')[0]) 
+        except Exception as e:
+            logging.warning(f"无法从文件名 {filename} 解析 Iteration，设为 Unknown。Error: {e}")
+            latest_iter = -1
 
+        logging.info(f"Found latest checkpoint: {os.path.basename(latest_checkpoint_path)} (Iter: {latest_iter})")
         checkpoint = torch.load(latest_checkpoint_path, map_location=device)
         net.load_state_dict(checkpoint["state_dict"])
-        logging.info(f"Load weights success. ")
+        logging.info("Load weights success.")
+
+        # export model weights
+        model_save_path = os.path.join(config.save_dir, config.model_name)
+        model_export_path = os.path.join(model_save_path, "export")
+        os.makedirs(model_save_path, exist_ok=True)
+        os.makedirs(model_export_path, exist_ok=True)
+        model_export_file = os.path.join(model_export_path, f"model.pth")
+        torch.save({"state_dict": net.state_dict()}, model_export_file)
+        logging.info("Export model weights success.")
 
         dataloader = make_data_loader(
             phase="train",
@@ -1670,7 +1814,7 @@ if __name__ == "__main__":
             repeat=True,
             config=config,
             device='cpu',
-            augment_data=True,
+            augment_data=False,
             transforms=[
                 lambda x: VoxelFilterTransform(x, voxel_size=0.015),
                 lambda x: RandomRotationTransform(x, max_angle_deg=0.0),
