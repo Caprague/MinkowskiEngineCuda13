@@ -1677,6 +1677,7 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
         iter_loss = sum(step_total_losses) / len(step_total_losses)
         writer.add_scalar('Time/Iter_Total_Time', total_time, i)
         writer.add_scalar('Loss/Iter_Loss', iter_loss, i)
+        writer.add_scalar('Params/LR', scheduler.get_last_lr()[0], i)
 
         if i % config.stat_freq_iter == 0:
             steps_total_losses_str = ", ".join([f"{v:.3e}" for v in step_total_losses])
@@ -1696,13 +1697,14 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             torch.save({
                 "state_dict": net.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "curr_iter": i,
                 "curr_step": train_steps,
             }, model_save_file)
-            scheduler.step()
-            logging.info(f"LR: {scheduler.get_lr()}")
-            writer.add_scalar('Params/LR', scheduler.get_lr()[0], i)
+            logging.info(f"LR: {scheduler.get_last_lr()}")
             net.train()
+
+        scheduler.step()
 
 
 ###############################################################################
@@ -1799,7 +1801,9 @@ if __name__ == "__main__":
                     net.load_state_dict(checkpoint["state_dict"])
                     if config.load_optimizer:
                         optimizer.load_state_dict(checkpoint["optimizer"])
-                    
+                        if "scheduler" in checkpoint:
+                            scheduler.load_state_dict(checkpoint["scheduler"])
+
                     filename = os.path.basename(latest_checkpoint)
                     start_iter = checkpoint["curr_iter"] + 1
                     start_step = checkpoint["curr_step"] + 1
