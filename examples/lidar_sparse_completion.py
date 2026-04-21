@@ -528,6 +528,43 @@ def RandomNoiseTransform(data_dict, noise_std=0.005):
     return data_dict
 
 
+def StridedSamplingTransform(data_dict, stride_list=[3, 8]):
+    """
+    Transform 函数：对 data_dict 中的时序数据进行间隔采样（Strided Sampling）。
+    从 stride_list 中随机选择一个间隔，对 partial、complete、pos_data、quat_data
+    按该间隔从首帧采到末帧。
+
+    Args:
+        data_dict (dict): 包含 'partial', 'complete', 'pos_data', 'quat_data' 等键的字典。
+        stride_list (list[int]): 采样间隔候选列表，从中随机选择一个间隔。
+    """
+    if 'partial' not in data_dict or len(data_dict['partial']) == 0:
+        return data_dict
+
+    num_frames = len(data_dict['partial'])
+    if num_frames < 2:
+        return data_dict
+
+    # 从 stride_list 中随机选择一个间隔
+    stride = int(np.random.choice(stride_list))
+
+    # 生成采样索引：从首帧开始，按间隔采到末帧
+    indices = list(range(0, num_frames, stride))
+
+    if len(indices) < 2:
+        # 如果采样后帧数过少，则跳过采样，保留原数据
+        return data_dict
+
+    # 对各时序数据按索引采样
+    data_dict['partial'] = [data_dict['partial'][i] for i in indices]
+    data_dict['complete'] = [data_dict['complete'][i] for i in indices]
+    data_dict['pos_data'] = data_dict['pos_data'][indices]
+    data_dict['quat_data'] = data_dict['quat_data'][indices]
+    data_dict['num_frames'] = len(indices)
+
+    return data_dict
+
+
 ###############################################################################
 # Preprocess functions
 ###############################################################################
@@ -1725,6 +1762,7 @@ if __name__ == "__main__":
             device='cpu',
             augment_data=True,
             transforms=[
+                lambda x: StridedSamplingTransform(x, stride_list=[2, 4, 6, 8, 10]),
                 lambda x: VoxelFilterTransform(x, voxel_size=0.015),
                 lambda x: RandomRotationTransform(x, max_angle_deg=3.0),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),
@@ -1816,6 +1854,7 @@ if __name__ == "__main__":
             device='cpu',
             augment_data=False,
             transforms=[
+                lambda x: StridedSamplingTransform(x, stride_list=[2, 4, 6, 8, 10]),
                 lambda x: VoxelFilterTransform(x, voxel_size=0.015),
                 lambda x: RandomRotationTransform(x, max_angle_deg=0.0),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),

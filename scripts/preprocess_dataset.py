@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
-数据集预处理脚本：对 Meta 下的时序点云数据集进行裁剪分割和数据增强。
+数据集预处理脚本：对 Meta 下的时序点云数据集进行连续裁剪分割。
 
-两种处理模式：
-  Mode 1 (continuous): 连续裁剪 — 按 seq_len 帧一组，连续切分原序列
-  Mode 2 (strided):   间隔采样 — 按 stride_list 指定间隔，从首帧采到末帧，每个间隔生成1个样本
-
+按 seq_len 帧一组，连续切分原序列，不足 seq_len 的尾部丢弃。
 处理后的数据保存到 DataCollection/Processed/，目录结构与 Meta 一致。
 
 用法示例：
-  # Mode 1: 连续裁剪，每组20帧
-  python scripts/preprocess_dataset.py --mode continuous --seq_len 20
-
-  # Mode 2: 间隔采样，间隔3和8
-  python scripts/preprocess_dataset.py --mode strided --stride_list 3 8
+  python scripts/preprocess_dataset.py --seq_len 20
 """
 
 import os
@@ -49,16 +42,15 @@ def slice_transform(src_npz_path, indices, dst_npz_path):
 
 def process_continuous(src_root, dst_root, seq_len):
     """
-    Mode 1: 连续裁剪
     对每个原始序列，按 seq_len 帧一组连续切分，不足 seq_len 的尾部丢弃。
     """
-    logging.info(f"[Mode: continuous] seq_len={seq_len}")
+    logging.info(f"[seq_len={seq_len}] 开始连续裁剪...")
     total_new_seqs = 0
 
     # 遍历 type/phase 层级
     for type_dir in sorted(glob.glob(os.path.join(src_root, "*/"))):
         type_name = os.path.basename(os.path.normpath(type_dir))
-        out_type_name = f"{type_name}_continuous"  # 输出目录名合并模式后缀
+        out_type_name = f"{type_name}_continuous"
         for phase_dir in sorted(glob.glob(os.path.join(type_dir, "*/"))):
             phase_name = os.path.basename(os.path.normpath(phase_dir))
 
@@ -129,95 +121,13 @@ def process_continuous(src_root, dst_root, seq_len):
                 f"  {type_name}/{phase_name}: 已生成 {total_new_seqs} 个新序列"
             )
 
-    logging.info(f"[Mode: continuous] 完成，共生成 {total_new_seqs} 个新序列")
-    return total_new_seqs
-
-
-def process_strided(src_root, dst_root, stride_list):
-    """
-    Mode 2: 间隔采样
-    对每个原始序列，按 stride_list 中每个间隔从首帧采到末帧，每个间隔生成1个样本。
-    例: stride_list=[3,8]，100帧原序列 → stride=3 抽取34帧，stride=8 抽取13帧
-    """
-    logging.info(f"[Mode: strided] stride_list={stride_list}")
-    total_new_seqs = 0
-
-    for type_dir in sorted(glob.glob(os.path.join(src_root, "*/"))):
-        type_name = os.path.basename(os.path.normpath(type_dir))
-        for phase_dir in sorted(glob.glob(os.path.join(type_dir, "*/"))):
-            phase_name = os.path.basename(os.path.normpath(phase_dir))
-
-            partial_root = os.path.join(phase_dir, "partial")
-            complete_root = os.path.join(phase_dir, "complete")
-            transform_root = os.path.join(phase_dir, "transform")
-
-            if not os.path.exists(partial_root):
-                continue
-
-            for seq_dir in sorted(glob.glob(os.path.join(partial_root, "*/"))):
-                seq_name = os.path.basename(os.path.normpath(seq_dir))
-
-                p_pcds = get_sorted_pcd_paths(os.path.join(partial_root, seq_name))
-                c_pcds = get_sorted_pcd_paths(os.path.join(complete_root, seq_name))
-                t_npz = os.path.join(transform_root, f"{seq_name}.npz")
-
-                num_frames = len(p_pcds)
-
-                # 遍历 stride_list 中每个间隔
-                for stride in stride_list:
-                    out_type_name = f"{type_name}_strided{stride}"
-                    # 从首帧开始，按间隔采到末尾
-                    indices = list(range(0, num_frames, stride))
-
-                    if len(indices) < 2:
-                        logging.warning(
-                            f"跳过 {type_name}/{phase_name}/{seq_name} stride={stride}: "
-                            f"采样后仅 {len(indices)} 帧，过少"
-                        )
-                        continue
-
-                    new_seq_name = f"{total_new_seqs:04d}"
-
-                    dst_partial_seq = os.path.join(
-                        dst_root, out_type_name, phase_name, "partial", new_seq_name
-                    )
-                    dst_complete_seq = os.path.join(
-                        dst_root, out_type_name, phase_name, "complete", new_seq_name
-                    )
-                    dst_transform_dir = os.path.join(
-                        dst_root, out_type_name, phase_name, "transform"
-                    )
-                    os.makedirs(dst_partial_seq, exist_ok=True)
-                    os.makedirs(dst_complete_seq, exist_ok=True)
-                    os.makedirs(dst_transform_dir, exist_ok=True)
-
-                    # 复制 pcd 文件（重新编号 000~）
-                    for new_idx, orig_idx in enumerate(indices):
-                        src_pcd = p_pcds[orig_idx]
-                        dst_pcd = os.path.join(dst_partial_seq, f"{new_idx:03d}.pcd")
-                        shutil.copy2(src_pcd, dst_pcd)
-
-                        src_pcd = c_pcds[orig_idx]
-                        dst_pcd = os.path.join(dst_complete_seq, f"{new_idx:03d}.pcd")
-                        shutil.copy2(src_pcd, dst_pcd)
-
-                    # 切片 transform
-                    dst_npz = os.path.join(dst_transform_dir, f"{new_seq_name}.npz")
-                    slice_transform(t_npz, indices, dst_npz)
-
-                    total_new_seqs += 1
-
-            logging.info(
-                f"  {type_name}/{phase_name}: 已生成 {total_new_seqs} 个新序列"
-            )
-
-    logging.info(f"[Mode: strided] 完成，共生成 {total_new_seqs} 个新序列")
+    logging.info(f"完成，共生成 {total_new_seqs} 个新序列")
     return total_new_seqs
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="时序点云数据集预处理：裁剪分割与数据增强"
+        description="时序点云数据集预处理：连续裁剪分割"
     )
     parser.add_argument(
         "--src_root",
@@ -232,24 +142,10 @@ def main():
         help="输出数据集根目录",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["continuous", "strided"],
-        default="continuous",
-        help="处理模式: continuous=连续裁剪, strided=间隔采样",
-    )
-    parser.add_argument(
         "--seq_len",
         type=int,
         default=20,
-        help="continuous 模式的新序列长度（每组帧数）",
-    )
-    parser.add_argument(
-        "--stride_list",
-        type=int,
-        nargs="+",
-        default=[3, 8],
-        help="strided 模式的采样间隔列表，如 --stride_list 3 8",
+        help="新序列长度（每组帧数）",
     )
 
     args = parser.parse_args()
@@ -262,24 +158,12 @@ def main():
 
     logging.info(f"源目录: {args.src_root}")
     logging.info(f"输出目录: {args.dst_root}")
-    logging.info(f"参数: mode={args.mode}, seq_len={args.seq_len}, stride_list={args.stride_list}")
+    logging.info(f"参数: seq_len={args.seq_len}")
 
-    if args.mode == "continuous":
-        process_continuous(args.src_root, args.dst_root, args.seq_len)
-    elif args.mode == "strided":
-        process_strided(args.src_root, args.dst_root, args.stride_list)
+    process_continuous(args.src_root, args.dst_root, args.seq_len)
 
     logging.info("全部处理完成！")
 
 
 if __name__ == "__main__":
     main()
-
-    """
-        # Mode 1: 连续裁剪，每组20帧
-        python scripts/preprocess_dataset.py --mode continuous --seq_len 20
-
-        # Mode 2: 间隔采样，间隔3和8
-        python scripts/preprocess_dataset.py --mode strided --stride_list 3 8
-    """
-
