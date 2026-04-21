@@ -67,7 +67,7 @@ logging.basicConfig(
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--resolution",         type=int,                   default=64)
-parser.add_argument("--max_iter",           type=int,                   default=5001)
+parser.add_argument("--max_iter",           type=int,                   default=20001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=50)
 parser.add_argument("--save_freq_iter",     type=int,                   default=200)
 parser.add_argument("--batch_size",         type=int,                   default=6)
@@ -79,7 +79,7 @@ parser.add_argument("--max_norm",           type=float,                 default=
 parser.add_argument("--num_workers",        type=int,                   default=6)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v8")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v9")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=True)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
