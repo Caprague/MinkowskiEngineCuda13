@@ -79,7 +79,7 @@ parser.add_argument("--max_norm",           type=float,                 default=
 parser.add_argument("--num_workers",        type=int,                   default=6)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v9")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v10")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=True)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
@@ -577,8 +577,8 @@ def StridedSamplingTransform(data_dict, stride_list=[3, 8]):
 # 自定义数据集类
 class ConstructTerrainDataset(torch.utils.data.Dataset):
     def __init__(self, phase="train", type=None, config=None, device='cpu', augment_data=False, transforms=None):
-        self.phase = phase                      # "train", "test"
         self.type = type                        # "walk", ...
+        self.phase = phase                      # "train", "test"
         self.augment_data = augment_data        # 是否启用数据增强
         self.transforms = transforms            # 预处理函数
         self.resolution = config.resolution     # 体素分辨率

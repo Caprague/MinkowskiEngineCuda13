@@ -132,13 +132,13 @@ def main():
     parser.add_argument(
         "--src_root",
         type=str,
-        default="./DataCollection/Meta",
+        default="/workspace/Share/DataCollection/Meta",
         help="源数据集根目录",
     )
     parser.add_argument(
         "--dst_root",
         type=str,
-        default="./DataCollection/Processed",
+        default="/workspace/Share/DataCollection/Processed",
         help="输出数据集根目录",
     )
     parser.add_argument(
