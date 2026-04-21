@@ -81,7 +81,7 @@ parser.add_argument("--log_dir",            type=str,                   default=
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v10")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
-parser.add_argument("--cache_use",          type=bool,                  default=True)
+parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=4)
 parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
@@ -203,11 +203,11 @@ def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None):
     return pcd
 
 
-def make_data_loader(phase, batch_size, shuffle, num_workers, repeat, config, device, augment_data, transforms):
+def make_data_loader(phase, batch_size, shuffle, num_workers, repeat, config, augment_data, transforms):
     """
     辅助函数，用于获取 data loader
     """
-    data_set = ConstructTerrainDataset(phase=phase, config=config, device=device, augment_data=augment_data, transforms=transforms)
+    data_set = ConstructTerrainDataset(phase=phase, config=config, augment_data=augment_data, transforms=transforms)
 
     args = {
         "batch_size": batch_size,                       # 小批量样本尺寸
@@ -576,7 +576,7 @@ def StridedSamplingTransform(data_dict, stride_list=[3, 8]):
 
 # 自定义数据集类
 class ConstructTerrainDataset(torch.utils.data.Dataset):
-    def __init__(self, phase="train", type=None, config=None, device='cpu', augment_data=False, transforms=None):
+    def __init__(self, phase="train", type=None, config=None, augment_data=False, transforms=None):
         self.type = type                        # "walk", ...
         self.phase = phase                      # "train", "test"
         self.augment_data = augment_data        # 是否启用数据增强
@@ -585,7 +585,6 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
         self.samples = []                       # 存储配对好的样本信息
         self.cache = {}                         # 样本加载缓存
         self.last_cache_percent = 0             # 样本缓存比例
-        self.device = device
         self.cache_use = config.cache_use
         
         # 修改根目录路径以适应新数据集结构
@@ -676,7 +675,7 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
     
-    def _load_pcd_sequence(self, pcd_paths, device):
+    def _load_pcd_sequence(self, pcd_paths):
         """
         辅助函数：加载一组 PCD 文件路径，处理并合并为一个样本列表
         """
@@ -744,8 +743,8 @@ class ConstructTerrainDataset(torch.utils.data.Dataset):
             'type': sample_info['type'],
             'seq_idx': sample_info['seq_idx'],
             'num_frames': len(sample_info['partial_paths']),
-            'partial': self._load_pcd_sequence(sample_info['partial_paths'], self.device),
-            'complete': self._load_pcd_sequence(sample_info['complete_paths'], self.device),
+            'partial': self._load_pcd_sequence(sample_info['partial_paths']),
+            'complete': self._load_pcd_sequence(sample_info['complete_paths']),
             'pos_data': sample_info['pos_data'],
             'quat_data': sample_info['quat_data'],
         }
@@ -939,6 +938,38 @@ class Visualizer:
         self.vis.add_geometry(self.sin_hist_pcd)
         self.vis.add_geometry(self.gt_pcd)
         self.vis.add_geometry(self.sout_pcd)
+
+        # 初始化包围盒线框 (8顶点, 12边)
+        def _init_bbox_lineset(color):
+            ls = o3d.geometry.LineSet()
+            ls.points = o3d.utility.Vector3dVector(np.zeros((8, 3)))
+            ls.lines = o3d.utility.Vector2iVector([
+                [0, 1], [1, 2], [2, 3], [3, 0],  # 底面
+                [4, 5], [5, 6], [6, 7], [7, 4],  # 顶面
+                [0, 4], [1, 5], [2, 6], [3, 7],  # 立柱
+            ])
+            ls.paint_uniform_color(color)
+            return ls
+
+        # 静态固定 1x1x1 包围盒 (浅灰色)
+        self.sin_curr_bbox = _init_bbox_lineset([0.7, 0.7, 0.7])
+        self.sin_hist_bbox = _init_bbox_lineset([0.7, 0.7, 0.7])
+        self.gt_bbox = _init_bbox_lineset([0.7, 0.7, 0.7])
+        self.sout_bbox = _init_bbox_lineset([0.7, 0.7, 0.7])
+        # 动态点云范围包围盒 (青色)
+        self.sin_curr_bbox_dyn = _init_bbox_lineset([0.0, 0.8, 1.0])
+        self.sin_hist_bbox_dyn = _init_bbox_lineset([0.0, 0.8, 1.0])
+        self.gt_bbox_dyn = _init_bbox_lineset([0.0, 0.8, 1.0])
+        self.sout_bbox_dyn = _init_bbox_lineset([0.0, 0.8, 1.0])
+
+        self.vis.add_geometry(self.sin_curr_bbox)
+        self.vis.add_geometry(self.sin_hist_bbox)
+        self.vis.add_geometry(self.gt_bbox)
+        self.vis.add_geometry(self.sout_bbox)
+        self.vis.add_geometry(self.sin_curr_bbox_dyn)
+        self.vis.add_geometry(self.sin_hist_bbox_dyn)
+        self.vis.add_geometry(self.gt_bbox_dyn)
+        self.vis.add_geometry(self.sout_bbox_dyn)
         
         self.vis.register_key_callback(ord("N"), self.render_sample)
         self.vis.register_key_callback(ord("P"), self.prev_sample)        
@@ -1026,7 +1057,13 @@ class Visualizer:
         _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
 
         t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
-        _, t_c_coords_float_list, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
+        _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
+        t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
+        # 控制 Chamfer 真值密度，防止 OOM
+        for i in range(len(t_c_coords_float_list)):
+            if t_c_coords_float_list[i].shape[0] > 16384:
+                idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
+                t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
         curr_feats_list = compute_feats(
             coords_float_list=t_p_coords_float_list,
             coords_voxel_list=t_p_coords_voxel_list,
@@ -1139,7 +1176,68 @@ class Visualizer:
         self.vis.update_geometry(self.sin_hist_pcd)
         self.vis.update_geometry(self.gt_pcd)
         self.vis.update_geometry(self.sout_pcd)
-        
+
+        # 更新固定 1x1x1 静态包围盒线框 (归一化坐标 [0,1] 范围)
+        def _update_static_bbox(lineset, translate_offset, rotate_matrix):
+            verts = np.array([
+                [0, 0, 0],
+                [1, 0, 0],
+                [1, 1, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [1, 0, 1],
+                [1, 1, 1],
+                [0, 1, 1],
+            ])
+            if translate_offset is not None:
+                verts = verts + np.array(translate_offset)
+            if rotate_matrix is not None:
+                verts = verts @ rotate_matrix.T
+            lineset.points = o3d.utility.Vector3dVector(verts)
+
+        # 更新动态点云范围包围盒线框 (体素对齐)
+        res = config.resolution
+        def _update_dynamic_bbox(lineset, points, translate_offset, rotate_matrix):
+            if points.size == 0:
+                lineset.points = o3d.utility.Vector3dVector(np.zeros((8, 3)))
+                return
+            min_bound = np.floor(points.min(axis=0) * res) / res
+            max_bound = np.ceil(points.max(axis=0) * res) / res
+            max_bound = np.maximum(max_bound, min_bound + 1.0 / res)
+            verts = np.array([
+                [min_bound[0], min_bound[1], min_bound[2]],
+                [max_bound[0], min_bound[1], min_bound[2]],
+                [max_bound[0], max_bound[1], min_bound[2]],
+                [min_bound[0], max_bound[1], min_bound[2]],
+                [min_bound[0], min_bound[1], max_bound[2]],
+                [max_bound[0], min_bound[1], max_bound[2]],
+                [max_bound[0], max_bound[1], max_bound[2]],
+                [min_bound[0], max_bound[1], max_bound[2]],
+            ])
+            if translate_offset is not None:
+                verts = verts + np.array(translate_offset)
+            if rotate_matrix is not None:
+                verts = verts @ rotate_matrix.T
+            lineset.points = o3d.utility.Vector3dVector(verts)
+
+        _update_static_bbox(self.sin_curr_bbox, [-0.5, -0.5, 0], self.M)
+        _update_static_bbox(self.sin_hist_bbox, [0.5, -0.5, 0], self.M)
+        _update_static_bbox(self.gt_bbox, [-0.5, 0.5, 0], self.M)
+        _update_static_bbox(self.sout_bbox, [0.5, 0.5, 0], self.M)
+        _update_dynamic_bbox(self.sin_curr_bbox_dyn, sin_curr_pc, [-0.5, -0.5, 0], self.M)
+        _update_dynamic_bbox(self.sin_hist_bbox_dyn, sin_hist_pc, [0.5, -0.5, 0], self.M)
+        _update_dynamic_bbox(self.gt_bbox_dyn, gt_pc, [-0.5, 0.5, 0], self.M)
+        _update_dynamic_bbox(self.sout_bbox_dyn, sout_pc, [0.5, 0.5, 0], self.M)
+
+        self.vis.update_geometry(self.sin_curr_bbox)
+        self.vis.update_geometry(self.sin_hist_bbox)
+        self.vis.update_geometry(self.gt_bbox)
+        self.vis.update_geometry(self.sout_bbox)
+        self.vis.update_geometry(self.sin_curr_bbox_dyn)
+        self.vis.update_geometry(self.sin_hist_bbox_dyn)
+        self.vis.update_geometry(self.gt_bbox_dyn)
+        self.vis.update_geometry(self.sout_bbox_dyn)
+
 
 ###############################################################################
 # End of utility classes
@@ -1575,7 +1673,13 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
 
             # 体素化当前帧
             _, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
-            _, t_c_coords_float_list, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
+            _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
+            t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
+            # 控制 Chamfer 真值密度，防止 OOM
+            for i in range(len(t_c_coords_float_list)):
+                if t_c_coords_float_list[i].shape[0] > 16384:
+                    idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
+                    t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
             # 处理当前帧特征
             curr_feats_list = compute_feats(
                 coords_float_list=t_p_coords_float_list,
@@ -1761,12 +1865,11 @@ if __name__ == "__main__":
             num_workers=config.num_workers,
             repeat=True,
             config=config,
-            device='cpu',
             augment_data=True,
             transforms=[
-                lambda x: StridedSamplingTransform(x, stride_list=[2, 4, 6, 8, 10]),
-                lambda x: VoxelFilterTransform(x, voxel_size=0.015),
-                lambda x: RandomRotationTransform(x, max_angle_deg=3.0),
+                lambda x: StridedSamplingTransform(x, stride_list=[1]*11 + [2]*7 + [3]*4 + [4]*2 + [5]*1),
+                # lambda x: VoxelFilterTransform(x, voxel_size=0.015),
+                lambda x: RandomRotationTransform(x, max_angle_deg=1.5),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),
                 lambda x: RandomNoiseTransform(x, noise_std=0.004),
             ]
@@ -1855,12 +1958,11 @@ if __name__ == "__main__":
             num_workers=0,
             repeat=True,
             config=config,
-            device='cpu',
             augment_data=False,
             transforms=[
-                lambda x: StridedSamplingTransform(x, stride_list=[2, 4, 6, 8, 10]),
-                lambda x: VoxelFilterTransform(x, voxel_size=0.015),
-                lambda x: RandomRotationTransform(x, max_angle_deg=0.0),
+                lambda x: StridedSamplingTransform(x, stride_list=[1]*11 + [2]*7 + [3]*4 + [4]*2 + [5]*1),
+                # lambda x: VoxelFilterTransform(x, voxel_size=0.015),
+                lambda x: RandomRotationTransform(x, max_angle_deg=1.5),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),
                 lambda x: RandomNoiseTransform(x, noise_std=0.004),
             ]
