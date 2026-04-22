@@ -137,17 +137,23 @@ def voxelization(points_list, res: int=1, feats_list=None):
     return unique_points_list, coords_float_list, coords_int_list, new_feats_list
 
 
-def devoxelization(coords_list, res: int=1):
+def devoxelization(coords_list, z_offsets_list, res: int=1):
     points_list = []
     points_norm_list = []
-    
-    for coords in coords_list:
+
+    for i, coords in enumerate(coords_list):
         points = coords.float()
         points_norm = points / res
-        
+
+        z_offset = z_offsets_list[i]
+        if z_offset.dim() == 1:
+            z_offset = z_offset.unsqueeze(1)
+        points[:, 2:3] += z_offset
+        points_norm[:, 2:3] += z_offset / res
+
         points_list.append(points)
         points_norm_list.append(points_norm)
-        
+
     return points_norm_list, points_list
 
 
@@ -1141,15 +1147,18 @@ class Visualizer:
 
         # 前向传播
         with torch.no_grad():
-            out_cls, out_targets, sout, occ_probs = self.net(sin_fused, in_target_key)
+            out_cls, out_targets, sout, occ_probs, z_offsets = self.net(sin_fused, in_target_key)
 
         # 后处理与 Loss 计算 (保持不变)
         sout_coords_list, _ = sout.decomposed_coordinates_and_features
-        sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, res=config.resolution)
 
-        # 切分 occ_prob 并构建特征
-        num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+        # 切分 occ_prob 和 z_offset
+        num_points_list = [coords.shape[0] for coords in sout_coords_list]
         occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
+        z_offsets_list = torch.split(z_offsets.detach(), num_points_list)
+
+        sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, z_offsets_list, res=config.resolution)
+
         self.prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
         # Chamfer Distance Loss (法向加权)
@@ -1486,6 +1495,11 @@ class LidarCompletionNet(nn.Module):
             dec_ch[0], 1, kernel_size=1, bias=True, dimension=3
         )
 
+        # output z-axis offset reg layer
+        self.dec_s1_z_offset = ME.MinkowskiConvolution(
+            dec_ch[0], 1, kernel_size=1, bias=True, dimension=3
+        )
+
         # Pruning layer
         self.pruning = ME.MinkowskiPruning()
 
@@ -1618,6 +1632,7 @@ class LidarCompletionNet(nn.Module):
         # Add encoder features
         dec_s1 = dec_s1 + enc_s1
         dec_s1_cls = self.dec_s1_cls(dec_s1)
+        dec_s1_z_offset = self.dec_s1_z_offset(dec_s1)
         keep_s1 = (dec_s1_cls.F > self.activeF).squeeze()
         out_cls.append(dec_s1_cls)
 
@@ -1630,11 +1645,14 @@ class LidarCompletionNet(nn.Module):
 
         # Remove voxels s1
         dec_s1 = self.pruning(dec_s1, keep_s1)
-        
+
         # Occupancy Problities
         occ_probs = torch.sigmoid(dec_s1_cls.F.view(-1)[keep_s1])
 
-        return out_cls, targets, dec_s1, occ_probs
+        # Z-axis sub-voxel offsets (0~1)
+        z_offsets = torch.sigmoid(dec_s1_z_offset.F.view(-1)[keep_s1])
+
+        return out_cls, targets, dec_s1, occ_probs, z_offsets
 
 
 ###############################################################################
@@ -1773,15 +1791,18 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             in_target_key, _ = cm.insert_and_map(coordinates=batched_gt_coords, string_id="target")
 
             # 前向传播
-            out_cls, out_targets, sout, occ_probs = net(sin_fused, in_target_key)
+            out_cls, out_targets, sout, occ_probs, z_offsets = net(sin_fused, in_target_key)
 
             # 后处理与 Loss 计算 (保持不变)
             sout_coords_list, _ = sout.decomposed_coordinates_and_features
-            sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, res=config.resolution)
 
-            # 切分 occ_prob 并构建特征
-            num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+            # 切分 occ_prob 和 z_offset
+            num_points_list = [coords.shape[0] for coords in sout_coords_list]
             occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
+            z_offsets_list = torch.split(z_offsets.detach(), num_points_list)
+
+            sout_points_norm_list, sout_coords_floats_list = devoxelization(sout_coords_list, z_offsets_list, res=config.resolution)
+
             prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
             # Chamfer Distance Loss (法向加权)
