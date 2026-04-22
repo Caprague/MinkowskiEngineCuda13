@@ -70,7 +70,7 @@ parser.add_argument("--resolution",         type=int,                   default=
 parser.add_argument("--max_iter",           type=int,                   default=20001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=50)
 parser.add_argument("--save_freq_iter",     type=int,                   default=200)
-parser.add_argument("--batch_size",         type=int,                   default=6)
+parser.add_argument("--batch_size",         type=int,                   default=4)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
 parser.add_argument("--voxel_coef",         type=float,                 default=1.00)
@@ -78,10 +78,10 @@ parser.add_argument("--chamfer_coef",       type=float,                 default=
 parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.5,    help="chamfer dist precision")
 parser.add_argument("--chamfer_r_coef",     type=float,                 default=2.0,    help="chamfer dist recall")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
-parser.add_argument("--num_workers",        type=int,                   default=6)
+parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v10")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v9")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=10)
@@ -931,8 +931,8 @@ class Visualizer:
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(window_name="Main Viewer", width=1200, height=800, left=0, top=0)
         opt = self.vis.get_render_option()
-        opt.background_color = np.asarray([0, 0, 0]) # 黑色背景
-        opt.point_size = 2.0
+        opt.background_color = np.asarray([0.3, 0.3, 0.3])
+        opt.point_size = 5.0
         
         self.sin_curr_pcd = o3d.geometry.PointCloud()
         self.sin_hist_pcd = o3d.geometry.PointCloud()
@@ -1063,11 +1063,12 @@ class Visualizer:
         t_p_points_norm_list, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
         _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
         t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
-        # 控制 Chamfer 真值密度，防止 OOM
-        for i in range(len(t_c_coords_float_list)):
-            if t_c_coords_float_list[i].shape[0] > 16384:
-                idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
-                t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
+        for b in range(len(t_c_coords_float_list)):
+            if t_c_coords_float_list[b].shape[0] > 16384:
+                idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+                t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
+                t_c_points_list[b] = t_c_points_list[b][idx]
+        
         curr_feats_list = compute_feats(
             coords_float_list=t_p_coords_float_list,
             coords_voxel_list=t_p_coords_voxel_list,
@@ -1646,11 +1647,11 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
     prev_frame_data = [None] * config.batch_size
     beg_iter = start_iter
     end_iter = start_iter + config.max_iter
-    for i in range(beg_iter, end_iter):
+    for iter_idx in range(beg_iter, end_iter):
         start_time = time()
         data_dict = next(train_iter)
         data_time = time() - start_time
-        writer.add_scalar('Time/Iter_Data_Time', data_time, i)
+        writer.add_scalar('Time/Iter_Data_Time', data_time, iter_idx)
 
         step_total_losses = []
         step_cls_losses = []
@@ -1679,11 +1680,10 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             _, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(t_p_points_list, config.resolution)
             _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
             t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
-            # 控制 Chamfer 真值密度，防止 OOM
-            for i in range(len(t_c_coords_float_list)):
-                if t_c_coords_float_list[i].shape[0] > 16384:
-                    idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
-                    t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
+            for b in range(len(t_c_coords_float_list)):
+                if t_c_coords_float_list[b].shape[0] > 16384:
+                    idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+                    t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
             # 处理当前帧特征
             curr_feats_list = compute_feats(
                 coords_float_list=t_p_coords_float_list,
@@ -1783,30 +1783,30 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
         # 迭代结束统计
         total_time = time() - start_time
         iter_loss = sum(step_total_losses) / len(step_total_losses)
-        writer.add_scalar('Time/Iter_Total_Time', total_time, i)
-        writer.add_scalar('Loss/Iter_Loss', iter_loss, i)
-        writer.add_scalar('Params/LR', scheduler.get_last_lr()[0], i)
+        writer.add_scalar('Time/Iter_Total_Time', total_time, iter_idx)
+        writer.add_scalar('Loss/Iter_Loss', iter_loss, iter_idx)
+        writer.add_scalar('Params/LR', scheduler.get_last_lr()[0], iter_idx)
 
-        if i % config.stat_freq_iter == 0:
+        if iter_idx % config.stat_freq_iter == 0:
             steps_total_losses_str = ", ".join([f"{v:.3e}" for v in step_total_losses])
             step_cls_losses_str = ", ".join([f"{v:.3e}" for v in step_cls_losses])
             step_reg_losses_str = ", ".join([f"{v:.3e}" for v in step_reg_losses])
             logging.info(
-                f"Iter: {i}, Iter Ave Loss: {iter_loss:.3e}, Step: {train_steps}, Data Loading Time: {data_time:.3e}, Total Time: {total_time:.3e}\n"
+                f"Iter: {iter_idx}, Iter Ave Loss: {iter_loss:.3e}, Step: {train_steps}, Data Loading Time: {data_time:.3e}, Total Time: {total_time:.3e}\n"
                 f"Step Total Losses: [{steps_total_losses_str}]\n"
                 f"Step Cls Losses: [{step_cls_losses_str}]\n"
                 f"Step Reg Losses: [{step_reg_losses_str}]\n"
             )
 
-        if i % config.save_freq_iter == 0:
+        if iter_idx % config.save_freq_iter == 0:
             model_save_path = os.path.join(config.save_dir, config.model_name)
             os.makedirs(model_save_path, exist_ok=True)
-            model_save_file = os.path.join(model_save_path, f"model_{i}.pth")
+            model_save_file = os.path.join(model_save_path, f"model_{iter_idx}.pth")
             torch.save({
                 "state_dict": net.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "curr_iter": i,
+                "curr_iter": iter_idx,
                 "curr_step": train_steps,
             }, model_save_file)
             logging.info(f"LR: {scheduler.get_last_lr()}")
