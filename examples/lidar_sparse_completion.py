@@ -73,8 +73,10 @@ parser.add_argument("--save_freq_iter",     type=int,                   default=
 parser.add_argument("--batch_size",         type=int,                   default=6)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
-parser.add_argument("--alpha",              type=float,                 default=1.00)
-parser.add_argument("--beta",               type=float,                 default=0.25)
+parser.add_argument("--voxel_coef",         type=float,                 default=1.00)
+parser.add_argument("--chamfer_coef",       type=float,                 default=0.25)
+parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.25)   # chamfer dist precision
+parser.add_argument("--chamfer_r_coef",     type=float,                 default=0.75)   # chamfer dist recall
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=6)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
@@ -82,7 +84,7 @@ parser.add_argument("--save_dir",           type=str,                   default=
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v10")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=False)
-parser.add_argument("--max_visualization",  type=int,                   default=4)
+parser.add_argument("--max_visualization",  type=int,                   default=10)
 parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
@@ -859,8 +861,10 @@ class ChamferDistanceLoss(nn.Module):
     计算两个点云集合之间的 Chamfer Distance。
     无需两个点云的点数相同，也无需点的顺序对应。
     """
-    def __init__(self):
+    def __init__(self, precision, recall):
         super(ChamferDistanceLoss, self).__init__()
+        self.precision_coef = precision
+        self.recall_coef = recall
 
     def forward(self, pred, gt):
         """
@@ -889,8 +893,8 @@ class ChamferDistanceLoss(nn.Module):
         min_dist_gt_to_pred = torch.min(dist_matrix, dim=1)[0] # (B, M)
         
         # 计算平均损失 (Chamfer Distance)
-        # 对两个方向的距离求平均，然后对 Batch 求平均
-        loss = torch.mean(min_dist_pred_to_gt) + torch.mean(min_dist_gt_to_pred)
+        # 系数调节精度与回召率
+        loss = torch.mean(min_dist_pred_to_gt) * self.precision_coef + torch.mean(min_dist_gt_to_pred) * self.recall_coef
         
         return loss
 
@@ -901,11 +905,11 @@ class Visualizer:
         self.net = net
         self.net.eval()
         
-        self.crit1 = ChamferDistanceLoss().to(device)
-        self.crit2 = nn.BCEWithLogitsLoss()
+        self.crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
+        self.crit2 = nn.BCEWithLogitsLoss().to(device)
         
-        self.alpha = config.alpha
-        self.beta = config.beta
+        self.voxel_coef = config.voxel_coef
+        self.chamfer_coef = config.chamfer_coef
         
         self.M = np.eye(3)
         
@@ -1140,7 +1144,7 @@ class Visualizer:
         voxel_cls_loss = batch_bce_loss / len(out_cls)
 
         # 总 Loss
-        total_loss = self.alpha * voxel_cls_loss + self.beta * points_reg_loss
+        total_loss = self.voxel_coef * voxel_cls_loss + self.chamfer_coef * points_reg_loss
         print(f"points_reg_loss: {points_reg_loss}")
         print(f"voxel_cls_loss: {voxel_cls_loss}")
         print(f"layer_losses: {layer_losses}")
@@ -1626,14 +1630,14 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
     writer = SummaryWriter(log_dir=run_log_dir)
     print(f"📝 TensorBoard logs saved to: {run_log_dir}")
     
-    crit1 = ChamferDistanceLoss().to(device)
+    crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
     crit2 = nn.BCEWithLogitsLoss().to(device)
     
     net.train()
     train_iter = iter(dataloader)
     
-    alpha = config.alpha
-    beta = config.beta
+    voxel_coef = config.voxel_coef
+    chamfer_coef = config.chamfer_coef
     
     train_steps = start_step
     data_time = 0
@@ -1760,7 +1764,7 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             step_cls_losses.append(voxel_cls_loss.item())
 
             # 总 Loss
-            total_loss = alpha * voxel_cls_loss + beta * points_reg_loss
+            total_loss = voxel_coef * voxel_cls_loss + chamfer_coef * points_reg_loss
             (total_loss / num_frames).backward()
 
             # 记录 Loss
@@ -1869,7 +1873,7 @@ if __name__ == "__main__":
             transforms=[
                 lambda x: StridedSamplingTransform(x, stride_list=[1]*11 + [2]*7 + [3]*4 + [4]*2 + [5]*1),
                 # lambda x: VoxelFilterTransform(x, voxel_size=0.015),
-                lambda x: RandomRotationTransform(x, max_angle_deg=1.5),
+                lambda x: RandomRotationTransform(x, max_angle_deg=1.0),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),
                 lambda x: RandomNoiseTransform(x, noise_std=0.004),
             ]
@@ -1895,7 +1899,7 @@ if __name__ == "__main__":
             if not checkpoint_files:
                 logging.warning(f"No checkpoint found in {checkpoint_dir}. Starting from scratch.")
             else:
-                checkpoint_files.sort()
+                checkpoint_files.sort(key=lambda f: int(os.path.basename(f).split('_')[-1].split('.')[0]))
                 latest_checkpoint = checkpoint_files[-1]
                 logging.info(f"Resuming from latest checkpoint: {latest_checkpoint}")
                 
@@ -1927,7 +1931,7 @@ if __name__ == "__main__":
         if not checkpoint_files:
             raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir_path}.")
         
-        checkpoint_files.sort() 
+        checkpoint_files.sort(key=lambda f: int(os.path.basename(f).split('_')[-1].split('.')[0]))
         latest_checkpoint_path = checkpoint_files[-1]
         
         try:
@@ -1962,7 +1966,7 @@ if __name__ == "__main__":
             transforms=[
                 lambda x: StridedSamplingTransform(x, stride_list=[1]*11 + [2]*7 + [3]*4 + [4]*2 + [5]*1),
                 # lambda x: VoxelFilterTransform(x, voxel_size=0.015),
-                lambda x: RandomRotationTransform(x, max_angle_deg=1.5),
+                lambda x: RandomRotationTransform(x, max_angle_deg=1.0),
                 lambda x: RandomCylinderCutoutTransform(x, max_radius=0.1, max_cylinders=3),
                 lambda x: RandomNoiseTransform(x, noise_std=0.004),
             ]
