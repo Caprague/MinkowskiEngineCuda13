@@ -75,8 +75,8 @@ parser.add_argument("--lr",                 type=float,                 default=
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
 parser.add_argument("--voxel_coef",         type=float,                 default=1.00)
 parser.add_argument("--chamfer_coef",       type=float,                 default=0.25)
-parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.25)   # chamfer dist precision
-parser.add_argument("--chamfer_r_coef",     type=float,                 default=0.75)   # chamfer dist recall
+parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.5,    help="chamfer dist precision")
+parser.add_argument("--chamfer_r_coef",     type=float,                 default=2.0,    help="chamfer dist recall")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=6)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
