@@ -857,16 +857,18 @@ class CollationAndTransformation:
 class ChamferDistanceLoss(nn.Module):
     """
     计算两个点云集合之间的 Chamfer Distance。
+    支持法向加权 (Normal-Weighted): 对 pred->gt 方向引入真值法向一致性权重。
     无需两个点云的点数相同，也无需点的顺序对应。
     """
     def __init__(self):
         super(ChamferDistanceLoss, self).__init__()
 
-    def forward(self, pred, gt):
+    def forward(self, pred, gt, gt_normals=None):
         """
         Args:
             pred: 预测点云，形状为 (B, N, 3) 或 (N, 3)
             gt: 真值点云，形状为 (B, M, 3) 或 (M, 3)
+            gt_normals: 真值法向量，形状为 (B, M, 3) 或 (M, 3)。若为 None 则退化为标准 CD。
                 N 和 M 可以不同 (点数不同)。
         Returns:
             loss: 标量 (Scalar) 损失值
@@ -876,23 +878,35 @@ class ChamferDistanceLoss(nn.Module):
             pred = pred.unsqueeze(0) # (N, 3) -> (1, N, 3)
         if gt.dim() == 2:
             gt = gt.unsqueeze(0)     # (M, 3) -> (1, M, 3)
+        if gt_normals is not None and gt_normals.dim() == 2:
+            gt_normals = gt_normals.unsqueeze(0)  # (1, M, 3)
 
         # 计算 Batch 间的距离矩阵
-        # (B, N, 3) -> (B, N, 1, 3)
-        # (B, M, 3) -> (B, 1, M, 3)
-        # 广播机制自动计算欧氏距离
         dist_matrix = torch.cdist(pred, gt, p=2) # (B, N, M)
         
         # 方向 1: 每个预测点到真值点的最小距离
-        min_dist_pred_to_gt = torch.min(dist_matrix, dim=2)[0] # (B, N)
-        # 方向 2: 每个真值点到预测点的最小距离
+        min_dist_pred_to_gt, nn_idx = torch.min(dist_matrix, dim=2) # (B, N)
+        
+        if gt_normals is not None:
+            B, N, _ = pred.shape
+            b_idx = torch.arange(B, device=pred.device).unsqueeze(1).expand(B, N)  # (B, N)
+            nn_normals = gt_normals[b_idx, nn_idx, :]  # (B, N, 3)
+            
+            direction = pred - gt[b_idx, nn_idx, :]  # (B, N, 3)
+            direction_norm = direction.norm(dim=2, keepdim=True) + 1e-8
+            direction = direction / direction_norm
+            
+            cosine = torch.abs(torch.sum(direction * nn_normals, dim=2))  # (B, N)
+            weights = 1.0 + cosine  # (B, N), 范围 [1.0, 2.0]
+            loss_pred_to_gt = torch.mean(min_dist_pred_to_gt * weights)
+        else:
+            loss_pred_to_gt = torch.mean(min_dist_pred_to_gt)
+        
+        # 方向 2: 每个真值点到预测点的最小距离 (预测点无法向，保持标准距离)
         min_dist_gt_to_pred = torch.min(dist_matrix, dim=1)[0] # (B, M)
+        loss_gt_to_pred = torch.mean(min_dist_gt_to_pred)
         
-        # 计算平均损失 (Chamfer Distance)
-        # 对两个方向的距离求平均，然后对 Batch 求平均
-        loss = torch.mean(min_dist_pred_to_gt) + torch.mean(min_dist_gt_to_pred)
-        
-        return loss
+        return loss_pred_to_gt + loss_gt_to_pred
 
 
 class Visualizer:
@@ -1060,10 +1074,24 @@ class Visualizer:
         _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
         t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
         # 控制 Chamfer 真值密度，防止 OOM
-        for i in range(len(t_c_coords_float_list)):
-            if t_c_coords_float_list[i].shape[0] > 16384:
-                idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
-                t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
+        for b in range(len(t_c_coords_float_list)):
+            if t_c_coords_float_list[b].shape[0] > 16384:
+                idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+                t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
+        # 对采样后的真值点云计算法向
+        t_c_normals_float_list = []
+        for coords in t_c_coords_float_list:
+            coords_np = coords.cpu().numpy() / config.resolution
+            if len(coords_np) >= 3:
+                pcd_o3d = o3d.geometry.PointCloud()
+                pcd_o3d.points = o3d.utility.Vector3dVector(coords_np)
+                pcd_o3d.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=10)
+                )
+                normals = np.asarray(pcd_o3d.normals)
+            else:
+                normals = np.zeros_like(coords_np)
+            t_c_normals_float_list.append(torch.from_numpy(normals).float().to(device))
         curr_feats_list = compute_feats(
             coords_float_list=t_p_coords_float_list,
             coords_voxel_list=t_p_coords_voxel_list,
@@ -1124,10 +1152,10 @@ class Visualizer:
         occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
         self.prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
-        # Chamfer Distance Loss
+        # Chamfer Distance Loss (法向加权)
         batch_chamfer_loss = 0
-        for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_floats_list):
-            batch_chamfer_loss += self.crit1(pred_tensor, gt_tensor)
+        for gt_tensor, gt_norm_tensor, pred_tensor in zip(t_c_coords_float_list, t_c_normals_float_list, sout_coords_floats_list):
+            batch_chamfer_loss += self.crit1(pred_tensor, gt_tensor, gt_norm_tensor)
         points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
 
         # Voxel BCE Loss
@@ -1676,10 +1704,24 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
             t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
             # 控制 Chamfer 真值密度，防止 OOM
-            for i in range(len(t_c_coords_float_list)):
-                if t_c_coords_float_list[i].shape[0] > 16384:
-                    idx = torch.randperm(t_c_coords_float_list[i].shape[0], device=t_c_coords_float_list[i].device)[:16384]
-                    t_c_coords_float_list[i] = t_c_coords_float_list[i][idx]
+            for b in range(len(t_c_coords_float_list)):
+                if t_c_coords_float_list[b].shape[0] > 16384:
+                    idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+                    t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
+            # 对采样后的真值点云计算法向 (主进程，最多 16384 点)
+            t_c_normals_float_list = []
+            for coords in t_c_coords_float_list:
+                coords_np = coords.cpu().numpy() / config.resolution
+                if len(coords_np) >= 3:
+                    pcd_o3d = o3d.geometry.PointCloud()
+                    pcd_o3d.points = o3d.utility.Vector3dVector(coords_np)
+                    pcd_o3d.estimate_normals(
+                        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=10)
+                    )
+                    normals = np.asarray(pcd_o3d.normals)
+                else:
+                    normals = np.zeros_like(coords_np)
+                t_c_normals_float_list.append(torch.from_numpy(normals).float().to(device))
             # 处理当前帧特征
             curr_feats_list = compute_feats(
                 coords_float_list=t_p_coords_float_list,
@@ -1742,10 +1784,10 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
             prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
-            # Chamfer Distance Loss
+            # Chamfer Distance Loss (法向加权)
             batch_chamfer_loss = 0
-            for gt_tensor, pred_tensor in zip(t_c_coords_float_list, sout_coords_floats_list):
-                batch_chamfer_loss += crit1(pred_tensor, gt_tensor)
+            for gt_tensor, gt_norm_tensor, pred_tensor in zip(t_c_coords_float_list, t_c_normals_float_list, sout_coords_floats_list):
+                batch_chamfer_loss += crit1(pred_tensor, gt_tensor, gt_norm_tensor)
             points_reg_loss = batch_chamfer_loss / len(t_c_coords_float_list)
             step_reg_losses.append(points_reg_loss.item())
 
