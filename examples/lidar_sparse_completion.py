@@ -1064,8 +1064,8 @@ class Visualizer:
         _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
         t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
         for b in range(len(t_c_coords_float_list)):
-            if t_c_coords_float_list[b].shape[0] > 16384:
-                idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+            if t_c_coords_float_list[b].shape[0] > 8192:
+                idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:8192]
                 t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
                 t_c_points_list[b] = t_c_points_list[b][idx]
         
@@ -1681,8 +1681,8 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             _, _, t_c_coords_voxel_list, _ = voxelization(t_c_points_list, config.resolution)
             t_c_coords_float_list = [p * config.resolution for p in t_c_points_list]
             for b in range(len(t_c_coords_float_list)):
-                if t_c_coords_float_list[b].shape[0] > 16384:
-                    idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:16384]
+                if t_c_coords_float_list[b].shape[0] > 8192:
+                    idx = torch.randperm(t_c_coords_float_list[b].shape[0], device=t_c_coords_float_list[b].device)[:8192]
                     t_c_coords_float_list[b] = t_c_coords_float_list[b][idx]
             # 处理当前帧特征
             curr_feats_list = compute_feats(
