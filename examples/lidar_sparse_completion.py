@@ -1308,6 +1308,88 @@ class MinkowskiGlobalContextBlock(nn.Module):
         return x * x_broadcasted
 
 
+class ZOffsetRegressionHead(nn.Module):
+    """
+    多尺度 Z 轴子体素偏移回归头。
+
+    设计思路参考 GRNet 的多层 MLP 回归头，结合以下三路信息：
+      1. dec_s1 局部特征（解码器全分辨率结构感知）
+      2. 全局场景上下文（对整个场景做 GlobalPooling + FC，broadcast 回各点）
+      3. 多层稀疏 MLP（3 层 kernel=1 稀疏卷积 + BN + ELU）做非线性变换
+
+    输入:
+        dec_s1   : ME.SparseTensor, 形状 [N, local_ch]
+        global_ctx: ME.SparseTensor, 全局编码最深层特征（粗粒度），
+                    形状 [B, global_ch]（经过 MinkowskiGlobalPooling）
+    输出:
+        z_offsets: torch.Tensor, 形状 [N]，范围 (-0.5, +0.5)
+    """
+    def __init__(self, local_ch: int, global_ch: int, mid_ch: int = 32):
+        super().__init__()
+
+        # 全局上下文压缩：粗粒度编码 global_ch -> mid_ch，broadcast 后与局部特征拼接
+        self.global_pool  = ME.MinkowskiGlobalPooling()
+        self.global_fc1   = ME.MinkowskiConvolution(global_ch, mid_ch, kernel_size=1, bias=True, dimension=3)
+        self.global_act1  = ME.MinkowskiELU()
+        self.global_fc2   = ME.MinkowskiConvolution(mid_ch, mid_ch, kernel_size=1, bias=True, dimension=3)
+        self.global_act2  = ME.MinkowskiELU()
+
+        # 局部特征压缩：避免 local_ch 过大时直接拼接参数量爆炸
+        self.local_fc     = ME.MinkowskiConvolution(local_ch, mid_ch, kernel_size=1, bias=True, dimension=3)
+        self.local_act    = ME.MinkowskiELU()
+
+        # 融合后的多层 MLP（3 层 kernel=1，等效逐点 MLP）
+        fused_ch = mid_ch * 2  # local mid_ch + global mid_ch
+        self.mlp = nn.Sequential(
+            ME.MinkowskiConvolution(fused_ch, mid_ch,     kernel_size=1, bias=False, dimension=3),
+            ME.MinkowskiBatchNorm(mid_ch),
+            ME.MinkowskiELU(),
+            ME.MinkowskiConvolution(mid_ch,   mid_ch // 2, kernel_size=1, bias=False, dimension=3),
+            ME.MinkowskiBatchNorm(mid_ch // 2),
+            ME.MinkowskiELU(),
+            ME.MinkowskiConvolution(mid_ch // 2, 1,        kernel_size=1, bias=True,  dimension=3),
+        )
+
+        # 最后一层 weight/bias 接近零初始化，避免训练初期偏移扰动过大
+        last_conv = self.mlp[-1]
+        nn.init.zeros_(last_conv.kernel)
+        nn.init.zeros_(last_conv.bias)
+
+    def forward(self, dec_s1: ME.SparseTensor, global_feat: ME.SparseTensor) -> ME.SparseTensor:
+        # 1. 全局上下文：pool -> FC，得到 batch 级全局向量 [B, mid_ch]
+        #    global_feat (enc_s32) 与 dec_s1 来自不同 CoordinateManager，
+        #    无法直接使用 MinkowskiBroadcast，改用 batch 索引手动 gather-expand。
+        g = self.global_pool(global_feat)   # SparseTensor: B 个点，每点 global_ch 维
+        g = self.global_fc1(g)              # [B, mid_ch]
+        g = self.global_act1(g)
+        g = self.global_fc2(g)              # [B, mid_ch]
+        g = self.global_act2(g)
+
+        # g.C[:, 0] 是 global_pool 输出的 batch 索引（0, 1, 2, ...，保证升序且连续）
+        # dec_s1.C[:, 0] 是 dec_s1 每个非零点的 batch 索引
+        # 用 dec_s1 的 batch 索引从 g.F 中 gather，实现 per-point broadcast
+        batch_indices = dec_s1.C[:, 0].long()           # [N]
+        g_dense = g.F[batch_indices]                     # [N, mid_ch]
+
+        # 2. 局部特征压缩
+        l = self.local_fc(dec_s1)                        # SparseTensor [N, mid_ch]
+        l = self.local_act(l)
+
+        # 3. 拼接：将 g_dense (dense Tensor) 与 l.F (dense Tensor) cat，
+        #    再封装为 SparseTensor，共享 dec_s1 的 CoordinateManager
+        fused_feats = torch.cat([l.F, g_dense], dim=1)  # [N, mid_ch*2]
+        fused = ME.SparseTensor(
+            features=fused_feats,
+            coordinate_map_key=l.coordinate_map_key,
+            coordinate_manager=l.coordinate_manager,
+        )
+
+        # 4. 多层 MLP
+        out = self.mlp(fused)                            # SparseTensor [N, 1]
+
+        return out
+
+
 class LidarCompletionNet(nn.Module):
     def __init__(self, resolution, activeF=0.5, 
                  encoder_channels = [16, 32, 64, 128, 256, 512], 
@@ -1495,9 +1577,13 @@ class LidarCompletionNet(nn.Module):
             dec_ch[0], 1, kernel_size=1, bias=True, dimension=3
         )
 
-        # output z-axis offset reg layer
-        self.dec_s1_z_offset = ME.MinkowskiConvolution(
-            dec_ch[0], 1, kernel_size=1, bias=True, dimension=3
+        # Z 轴子体素偏移回归头（多尺度特征融合 + 多层 MLP）
+        # local_ch: 最终解码器分辨率特征通道数
+        # global_ch: 最深编码器（enc_s32）经过全局上下文后的通道数，用于 scene-level 感知
+        self.dec_s1_z_offset = ZOffsetRegressionHead(
+            local_ch=dec_ch[0],
+            global_ch=enc_ch[5],
+            mid_ch=max(dec_ch[0], 32),
         )
 
         # Pruning layer
@@ -1632,7 +1718,7 @@ class LidarCompletionNet(nn.Module):
         # Add encoder features
         dec_s1 = dec_s1 + enc_s1
         dec_s1_cls = self.dec_s1_cls(dec_s1)
-        dec_s1_z_offset = self.dec_s1_z_offset(dec_s1)
+        dec_s1_z_offset = self.dec_s1_z_offset(dec_s1, enc_s32)
         keep_s1 = (dec_s1_cls.F > self.activeF).squeeze()
         out_cls.append(dec_s1_cls)
 
@@ -1649,8 +1735,8 @@ class LidarCompletionNet(nn.Module):
         # Occupancy Problities
         occ_probs = torch.sigmoid(dec_s1_cls.F.view(-1)[keep_s1])
 
-        # Z-axis sub-voxel offsets (0~1)
-        z_offsets = torch.sigmoid(dec_s1_z_offset.F.view(-1)[keep_s1])
+        # Z-axis sub-voxel offsets (-0.5~+0.5)
+        z_offsets = torch.tanh(dec_s1_z_offset.F.view(-1)[keep_s1]) * 0.5
 
         return out_cls, targets, dec_s1, occ_probs, z_offsets
 
@@ -1958,7 +2044,7 @@ if __name__ == "__main__":
             if not checkpoint_files:
                 logging.warning(f"No checkpoint found in {checkpoint_dir}. Starting from scratch.")
             else:
-                checkpoint_files.sort()
+                checkpoint_files.sort(key=lambda f: int(os.path.basename(f).split('_')[-1].split('.')[0]))
                 latest_checkpoint = checkpoint_files[-1]
                 logging.info(f"Resuming from latest checkpoint: {latest_checkpoint}")
                 
@@ -1990,7 +2076,7 @@ if __name__ == "__main__":
         if not checkpoint_files:
             raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir_path}.")
         
-        checkpoint_files.sort() 
+        checkpoint_files.sort(key=lambda f: int(os.path.basename(f).split('_')[-1].split('.')[0])) 
         latest_checkpoint_path = checkpoint_files[-1]
         
         try:
