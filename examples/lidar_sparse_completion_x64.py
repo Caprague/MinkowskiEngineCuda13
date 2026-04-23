@@ -190,7 +190,7 @@ def compute_feats(coords_float_list, coords_voxel_list, time_encoding, prob: flo
     return feats_list
 
 
-def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None):
+def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None, color_by_z=False):
     """
     辅助函数，将输入的 Tensor 点云转化为 Open3D 中的 pcd 点云格式，方便可视化/保存等
     """
@@ -198,7 +198,13 @@ def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None):
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.estimate_normals()
     if color is not None:
-        pcd.colors = o3d.utility.Vector3dVector(np.tile(color, (len(points), 1)))
+        if color_by_z and len(points) > 0:
+            z_vals = np.clip(points[:, 2], 0.0, 1.0)
+            brightness = 0.2 + 0.8 * z_vals[:, None]
+            colors = np.array(color).reshape(1, 3) * brightness
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
+        else:
+            pcd.colors = o3d.utility.Vector3dVector(np.tile(color, (len(points), 1)))
     if translate_offset is not None:
         pcd.translate(translate_offset)
     if rotate_matrix is not None:
@@ -1239,10 +1245,10 @@ class Visualizer:
         gt_pc = t_c_points_list[0].cpu().numpy()
         sout_pc = sout_points_norm_list[0].cpu().numpy()
         # open3d point cloud
-        sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-0.5, -0.5, 0], rotate_matrix=self.M) if sin_curr_pc.size > 0 else o3d.geometry.PointCloud()
-        sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[0.5, -0.5, 0], rotate_matrix=self.M) if sin_hist_pc.size > 0 else o3d.geometry.PointCloud()
-        gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-0.5, 0.5, 0], rotate_matrix=self.M) if gt_pc.size > 0 else o3d.geometry.PointCloud()
-        sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[0.5, 0.5, 0], rotate_matrix=self.M) if sout_pc.size > 0 else o3d.geometry.PointCloud()
+        sin_curr_pcd = PointCloud(sin_curr_pc, color=[1, 0, 0], translate_offset=[-0.5, -0.5, 0], rotate_matrix=self.M, color_by_z=True) if sin_curr_pc.size > 0 else o3d.geometry.PointCloud()
+        sin_hist_pcd = PointCloud(sin_hist_pc, color=[0, 0, 1], translate_offset=[0.5, -0.5, 0], rotate_matrix=self.M, color_by_z=True) if sin_hist_pc.size > 0 else o3d.geometry.PointCloud()
+        gt_pcd = PointCloud(gt_pc, color=[1, 1, 0], translate_offset=[-0.5, 0.5, 0], rotate_matrix=self.M, color_by_z=True) if gt_pc.size > 0 else o3d.geometry.PointCloud()
+        sout_pcd = PointCloud(sout_pc, color=[0, 1, 0], translate_offset=[0.5, 0.5, 0], rotate_matrix=self.M, color_by_z=True) if sout_pc.size > 0 else o3d.geometry.PointCloud()
         # update render obj
         self.sin_curr_pcd.points = o3d.utility.Vector3dVector(np.asarray(sin_curr_pcd.points))
         self.sin_curr_pcd.colors = o3d.utility.Vector3dVector(np.asarray(sin_curr_pcd.colors))
