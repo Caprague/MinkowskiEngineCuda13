@@ -89,7 +89,7 @@ parser.add_argument("--max_visualization",  type=int,                   default=
 parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
-PURNING_THRESHOLD = 0.0
+PURNING_THRESHOLD = 0.35
 ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
 DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
