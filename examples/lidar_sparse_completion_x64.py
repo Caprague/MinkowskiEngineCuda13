@@ -78,6 +78,7 @@ parser.add_argument("--chamfer_coef",       type=float,                 default=
 parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.5,    help="chamfer dist precision")
 parser.add_argument("--chamfer_r_coef",     type=float,                 default=2.0,    help="chamfer dist recall")
 parser.add_argument("--tv_coef",            type=float,                 default=0.01,   help="total variation regularization coef")
+parser.add_argument("--tv_mode",            type=str,                   default="6",    help="TV mode: 27 (3x3x3), 6 (face-only)")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
@@ -901,23 +902,39 @@ class ChamferDistanceLoss(nn.Module):
 class MinkowskiTVLoss(nn.Module):
     """
     Total Variation Loss for sparse voxel occupancy field.
-    Uses MinkowskiConvolution (3x3x3 uniform averaging) to compute neighbor average,
-    then penalizes the difference between each voxel's occupancy probability
-    and its neighbors' average probability.
+    Supports 27-neighbor and 6-neighbor (face-only) modes.
 
     L_tv = λ * Σ |σ(logit_v) - avg(σ(logits of neighbors))|
     """
-    def __init__(self):
+    def __init__(self, mode="27"):
+        """
+        Args:
+            mode: "27" = 3x3x3 uniform, "6" = 6 face neighbors uniform
+        """
         super().__init__()
+        self.mode = mode
         self.tv_conv = ME.MinkowskiConvolution(
             1, 1, kernel_size=3, bias=False, dimension=3
         )
         # Freeze weights (TV conv is fixed, not learned)
         for param in self.tv_conv.parameters():
             param.requires_grad = False
-        # Initialize with uniform averaging: all 27 positions (3x3x3) get weight 1/27
+
+        # Verified face neighbor indices (kernel_size=3, stride=1, x fastest, z slowest):
+        # -x:12, +x:14, -y:10, +y:16, -z:4, +z:22
+        FACE_H = [12, 14, 10, 16]  # horizontal (x-y plane)
+        FACE_V = [4, 22]           # vertical (z axis)
+
         with torch.no_grad():
-            nn.init.constant_(self.tv_conv.kernel, 1.0 / 27)
+            self.tv_conv.kernel.zero_()
+            if mode == "27":
+                # 3x3x3 uniform (includes self)
+                nn.init.constant_(self.tv_conv.kernel, 1.0 / 27)
+            elif mode == "6":
+                # 6 face neighbors only, uniform weight
+                self.tv_conv.kernel[FACE_H + FACE_V, 0, 0] = 1.0 / 6.0
+            else:
+                raise ValueError(f"Unknown TV mode: {mode}")
 
     def forward(self, cls_sparse_tensor):
         """
@@ -935,21 +952,16 @@ class MinkowskiTVLoss(nn.Module):
             coordinate_manager=cls_sparse_tensor.coordinate_manager,
         )
 
-        # Compute 3x3x3 neighborhood average (including self)
-        # In sparse conv: neighbor_avg = (1/27)*self_prob + (1/27)*sum_neighbor_probs
         neighbor_avg = self.tv_conv(prob_st)
 
-        # Laplacian: avg_26_neighbors - self_prob
-        # When all 26 neighbors exist:
-        #   avg_26 = (27*avg_27 - self_prob) / 26
-        #   laplacian = avg_26 - self_prob = (avg_27 - self_prob) * 27 / 26
-        # When some neighbors are missing (sparse boundary):
-        #   laplacian is slightly conservative (under-weights missing neighbors)
-        #   This is desired behavior — less regularization at sparse boundaries
-        laplacian = (neighbor_avg.F - prob) * (27.0 / 26.0)
+        if self.mode == "27":
+            # avg_27 includes self; convert to avg_26_neighbors - self_prob
+            laplacian = (neighbor_avg.F - prob) * (27.0 / 26.0)
+        else:
+            # 6-neighbor or anisotropic: kernel does NOT include self
+            laplacian = neighbor_avg.F - prob
 
         tv_loss = laplacian.abs().mean()
-
         return tv_loss
 
 
@@ -961,7 +973,7 @@ class Visualizer:
         
         self.crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
         self.crit2 = nn.BCEWithLogitsLoss().to(device)
-        self.crit3 = MinkowskiTVLoss().to(device)
+        self.crit3 = MinkowskiTVLoss(mode=config.tv_mode).to(device)
 
         self.voxel_coef = config.voxel_coef
         self.chamfer_coef = config.chamfer_coef
@@ -1699,7 +1711,7 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
     
     crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
     crit2 = nn.BCEWithLogitsLoss().to(device)
-    crit3 = MinkowskiTVLoss().to(device)
+    crit3 = MinkowskiTVLoss(mode=config.tv_mode).to(device)
 
     net.train()
     train_iter = iter(dataloader)
