@@ -67,9 +67,9 @@ logging.basicConfig(
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--resolution",         type=int,                   default=128)
-parser.add_argument("--max_iter",           type=int,                   default=20001)
+parser.add_argument("--max_iter",           type=int,                   default=30001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=50)
-parser.add_argument("--save_freq_iter",     type=int,                   default=200)
+parser.add_argument("--save_freq_iter",     type=int,                   default=5000)
 parser.add_argument("--batch_size",         type=int,                   default=4)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
@@ -90,8 +90,8 @@ parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
 PURNING_THRESHOLD = 0.35
-ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
-DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
+ENC_CHANNELS = [16, 32, 64, 128, 256, 512, 1024]
+DEC_CHANNELS = [16, 32, 64, 128, 256, 512, 1024]
 
 
 ###############################################################################
@@ -1344,16 +1344,16 @@ class MinkowskiGlobalContextBlock(nn.Module):
 
 class LidarCompletionNet(nn.Module):
     def __init__(self, resolution, activeF=0.5, 
-                 encoder_channels = [16, 32, 64, 128, 256, 512], 
-                 decoder_channels = [16, 32, 64, 128, 256, 512]):
+                 encoder_channels = [16, 32, 64, 128, 256, 512, 1024], 
+                 decoder_channels = [16, 32, 64, 128, 256, 512, 1024]):
         nn.Module.__init__(self)
 
-        # Input sparse tensor must have tensor stride 64
+        # Input sparse tensor must have tensor stride 128
         self.resolution = resolution
         self.activeF = activeF
         # Channels list
-        assert len(encoder_channels) == 6, "Encoder Channels list length must equal to 6 !!!"
-        assert len(decoder_channels) == 6, "Decoder Channels list length must equal to 6 !!!"
+        assert len(encoder_channels) == 7, "Encoder Channels list length must equal to 7 !!!"
+        assert len(decoder_channels) == 7, "Decoder Channels list length must equal to 7 !!!"
         enc_ch = encoder_channels
         dec_ch = decoder_channels
 
@@ -1365,7 +1365,7 @@ class LidarCompletionNet(nn.Module):
         )
 
         # Encoder
-        # EN B1 64->32
+        # EN B1 128->64
         self.enc_block_s1s2 = nn.Sequential(
             ME.MinkowskiConvolution(
                 enc_ch[0], enc_ch[1], kernel_size=2, stride=2, dimension=3
@@ -1377,7 +1377,7 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiELU(),
         )
 
-        # EN B2 32->16
+        # EN B2 64->32
         self.enc_block_s2s4 = nn.Sequential(
             ME.MinkowskiConvolution(
                 enc_ch[1], enc_ch[2], kernel_size=2, stride=2, dimension=3
@@ -1389,7 +1389,7 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiELU(),
         )
 
-        # EN B3 16->8
+        # EN B3 32->16
         self.enc_block_s4s8 = nn.Sequential(
             ME.MinkowskiConvolution(
                 enc_ch[2], enc_ch[3], kernel_size=2, stride=2, dimension=3
@@ -1401,7 +1401,7 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiELU(),
         )
 
-        # EN B4 8->4
+        # EN B4 16->8
         self.enc_block_s8s16 = nn.Sequential(
             ME.MinkowskiConvolution(
                 enc_ch[3], enc_ch[4], kernel_size=2, stride=2, dimension=3
@@ -1413,7 +1413,7 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiELU(),
         )
 
-        # EN B4 4->2
+        # EN B5 8->4
         self.enc_block_s16s32 = nn.Sequential(
             ME.MinkowskiConvolution(
                 enc_ch[4], enc_ch[5], kernel_size=2, stride=2, dimension=3
@@ -1425,11 +1425,43 @@ class LidarCompletionNet(nn.Module):
             ME.MinkowskiELU(),
         )
 
+        # EN B6 4->2
+        self.enc_block_s32s64 = nn.Sequential(
+            ME.MinkowskiConvolution(
+                enc_ch[5], enc_ch[6], kernel_size=2, stride=2, dimension=3
+            ),
+            ME.MinkowskiBatchNorm(enc_ch[6]),
+            ME.MinkowskiELU(),
+            ME.MinkowskiConvolution(enc_ch[6], enc_ch[6], kernel_size=3, dimension=3),
+            ME.MinkowskiBatchNorm(enc_ch[6]),
+            ME.MinkowskiELU(),
+        )
+
         # 全局上下文模块
-        self.global_context = MinkowskiGlobalContextBlock(in_channels=enc_ch[5])
+        self.global_context = MinkowskiGlobalContextBlock(in_channels=enc_ch[6])
 
         # Decoder
-        # DE B1 2-4
+        # DE B1 2->4
+        self.dec_block_s64s32 = nn.Sequential(
+            ME.MinkowskiGenerativeConvolutionTranspose(
+                dec_ch[6],
+                dec_ch[5],
+                kernel_size=2,
+                stride=2,
+                dimension=3,
+            ),
+            ME.MinkowskiBatchNorm(dec_ch[5]),
+            ME.MinkowskiELU(),
+            ME.MinkowskiConvolution(dec_ch[5], dec_ch[5], kernel_size=3, dimension=3),
+            ME.MinkowskiBatchNorm(dec_ch[5]),
+            ME.MinkowskiELU(),
+        )
+
+        self.dec_s32_cls = ME.MinkowskiConvolution(
+            dec_ch[5], 1, kernel_size=1, bias=True, dimension=3
+        )
+
+        # DE B2 4->8
         self.dec_block_s32s16 = nn.Sequential(
             ME.MinkowskiGenerativeConvolutionTranspose(
                 dec_ch[5],
@@ -1449,7 +1481,7 @@ class LidarCompletionNet(nn.Module):
             dec_ch[4], 1, kernel_size=1, bias=True, dimension=3
         )
         
-        # DE B2 4->8
+        # DE B3 8->16
         self.dec_block_s16s8 = nn.Sequential(
             ME.MinkowskiGenerativeConvolutionTranspose(
                 dec_ch[4],
@@ -1469,7 +1501,7 @@ class LidarCompletionNet(nn.Module):
             dec_ch[3], 1, kernel_size=1, bias=True, dimension=3
         )
 
-        # DE B3 8->16
+        # DE B4 16->32
         self.dec_block_s8s4 = nn.Sequential(
             ME.MinkowskiGenerativeConvolutionTranspose(
                 dec_ch[3],
@@ -1489,7 +1521,7 @@ class LidarCompletionNet(nn.Module):
             dec_ch[2], 1, kernel_size=1, bias=True, dimension=3
         )
 
-        # DE B4 16->32
+        # DE B5 32->64
         self.dec_block_s4s2 = nn.Sequential(
             ME.MinkowskiGenerativeConvolutionTranspose(
                 dec_ch[2],
@@ -1509,7 +1541,7 @@ class LidarCompletionNet(nn.Module):
             dec_ch[1], 1, kernel_size=1, bias=True, dimension=3
         )
 
-        # DE B5 32->64
+        # DE B6 64->128
         self.dec_block_s2s1 = nn.Sequential(
             ME.MinkowskiGenerativeConvolutionTranspose(
                 dec_ch[1],
@@ -1564,15 +1596,37 @@ class LidarCompletionNet(nn.Module):
         enc_s8 = self.enc_block_s4s8(enc_s4)
         enc_s16 = self.enc_block_s8s16(enc_s8)
         enc_s32 = self.enc_block_s16s32(enc_s16)
+        enc_s64 = self.enc_block_s32s64(enc_s32)
         
         # 应用全局上下文
-        out_s32 = self.global_context(enc_s32)
+        out_s64 = self.global_context(enc_s64)
 
         # Decoder
         # =========================================
+        # Block s64->s32
+        # =========================================
+        dec_s32 = self.dec_block_s64s32(out_s64)
+
+        # Add encoder features
+        dec_s32 = dec_s32 + enc_s32
+        dec_s32_cls = self.dec_s32_cls(dec_s32)
+        keep_s32 = (dec_s32_cls.F > self.activeF).squeeze()
+        out_cls.append(dec_s32_cls)
+
+        if target_key:
+            target = self.get_target(dec_s32, target_key)
+            targets.append(target)
+
+        if self.training:
+            keep_s32 += target
+
+        # Remove voxels s32
+        dec_s32 = self.pruning(dec_s32, keep_s32)
+        
+        # =========================================
         # Block s32->s16
         # =========================================
-        dec_s16 = self.dec_block_s32s16(out_s32)
+        dec_s16 = self.dec_block_s32s16(dec_s32)
 
         # Add encoder features
         dec_s16 = dec_s16 + enc_s16
