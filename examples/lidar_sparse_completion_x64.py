@@ -1000,7 +1000,7 @@ class Visualizer:
         self.vis.create_window(window_name="Main Viewer", width=1200, height=800, left=0, top=0)
         opt = self.vis.get_render_option()
         opt.background_color = np.asarray([0.3, 0.3, 0.3])
-        opt.point_size = 5.0
+        opt.point_size = 2.5
         
         self.sin_curr_pcd = o3d.geometry.PointCloud()
         self.sin_hist_pcd = o3d.geometry.PointCloud()
