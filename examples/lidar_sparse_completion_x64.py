@@ -26,6 +26,7 @@ import re
 import sys
 import glob
 import subprocess
+import shutil
 import argparse
 import logging
 import numpy as np
@@ -1708,7 +1709,16 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
     print(f"📝 TensorBoard logs saved to: {run_log_dir}")
-    
+
+    # 保存当前训练脚本到模型输出目录
+    model_save_path = os.path.join(config.save_dir, config.model_name)
+    os.makedirs(model_save_path, exist_ok=True)
+    try:
+        shutil.copy2(__file__, model_save_path)
+        logging.info(f"Training script saved to: {model_save_path}")
+    except Exception as e:
+        logging.warning(f"Failed to save training script: {e}")
+
     crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
     crit2 = nn.BCEWithLogitsLoss().to(device)
     crit3 = MinkowskiTVLoss(mode=config.tv_mode).to(device)
