@@ -199,8 +199,13 @@ def PointCloud(points, color=None, translate_offset=None, rotate_matrix=None, co
     pcd.estimate_normals()
     if color is not None:
         if color_by_z and len(points) > 0:
-            z_vals = np.clip(points[:, 2], 0.0, 1.0)
-            brightness = 0.2 + 0.8 * z_vals[:, None]
+            z_vals = points[:, 2]
+            z_min, z_max = z_vals.min(), z_vals.max()
+            if z_max > z_min:
+                z_norm = (z_vals - z_min) / (z_max - z_min)
+            else:
+                z_norm = np.ones_like(z_vals) * 0.5
+            brightness = 0.55 + 0.45 * z_norm[:, None]
             colors = np.array(color).reshape(1, 3) * brightness
             pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
         else:
