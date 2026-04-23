@@ -85,13 +85,11 @@ parser.add_argument("--save_dir",           type=str,                   default=
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_x64_v1")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=False)
-parser.add_argument("--max_visualization",  type=int,                   default=10)
+parser.add_argument("--max_visualization",  type=int,                   default=20)
 parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
 PURNING_THRESHOLD = 0.35
-# ENC_CHANNELS = [16, 32, 64, 128, 512, 1024]
-# DEC_CHANNELS = [16, 32, 64, 128, 512, 1024]
 ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
 DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
