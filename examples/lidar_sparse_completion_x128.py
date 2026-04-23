@@ -66,11 +66,11 @@ logging.basicConfig(
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--resolution",         type=int,                   default=64)
+parser.add_argument("--resolution",         type=int,                   default=128)
 parser.add_argument("--max_iter",           type=int,                   default=20001)
 parser.add_argument("--stat_freq_iter",     type=int,                   default=50)
 parser.add_argument("--save_freq_iter",     type=int,                   default=200)
-parser.add_argument("--batch_size",         type=int,                   default=4)
+parser.add_argument("--batch_size",         type=int,                   default=1)
 parser.add_argument("--lr",                 type=float,                 default=1e-3)
 parser.add_argument("--weight_decay",       type=float,                 default=1e-4)
 parser.add_argument("--voxel_coef",         type=float,                 default=1.00)
@@ -78,10 +78,10 @@ parser.add_argument("--chamfer_coef",       type=float,                 default=
 parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.5,    help="chamfer dist precision")
 parser.add_argument("--chamfer_r_coef",     type=float,                 default=2.0,    help="chamfer dist recall")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
-parser.add_argument("--num_workers",        type=int,                   default=4)
+parser.add_argument("--num_workers",        type=int,                   default=1)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
-parser.add_argument("--model_name",         type=str,                   default="lidar_completion_single_frame_v9")
+parser.add_argument("--model_name",         type=str,                   default="lidar_completion_x128_v0")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)
 parser.add_argument("--cache_use",          type=bool,                  default=False)
 parser.add_argument("--max_visualization",  type=int,                   default=10)
@@ -89,10 +89,8 @@ parser.add_argument("--resume",             action="store_true")
 parser.add_argument("--eval",               action="store_true")
 
 PURNING_THRESHOLD = 0.0
-ENC_CHANNELS = [16, 32, 64, 128, 512, 1024]
-DEC_CHANNELS = [16, 32, 64, 128, 512, 1024]
-# ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
-# DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
+ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
+DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
 
 ###############################################################################
