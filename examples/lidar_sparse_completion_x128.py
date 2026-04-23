@@ -77,6 +77,7 @@ parser.add_argument("--voxel_coef",         type=float,                 default=
 parser.add_argument("--chamfer_coef",       type=float,                 default=0.25)
 parser.add_argument("--chamfer_p_coef",     type=float,                 default=0.5,    help="chamfer dist precision")
 parser.add_argument("--chamfer_r_coef",     type=float,                 default=2.0,    help="chamfer dist recall")
+parser.add_argument("--tv_coef",             type=float,                 default=0.01,   help="total variation regularization coef")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=4)
 parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
@@ -897,6 +898,61 @@ class ChamferDistanceLoss(nn.Module):
         return loss
 
 
+class MinkowskiTVLoss(nn.Module):
+    """
+    Total Variation Loss for sparse voxel occupancy field.
+    Uses MinkowskiConvolution (3x3x3 uniform averaging) to compute neighbor average,
+    then penalizes the difference between each voxel's occupancy probability
+    and its neighbors' average probability.
+
+    L_tv = λ * Σ |σ(logit_v) - avg(σ(logits of neighbors))|
+    """
+    def __init__(self):
+        super().__init__()
+        self.tv_conv = ME.MinkowskiConvolution(
+            1, 1, kernel_size=3, bias=False, dimension=3
+        )
+        # Freeze weights (TV conv is fixed, not learned)
+        for param in self.tv_conv.parameters():
+            param.requires_grad = False
+        # Initialize with uniform averaging: all 27 positions (3x3x3) get weight 1/27
+        with torch.no_grad():
+            nn.init.constant_(self.tv_conv.kernel, 1.0 / 27)
+
+    def forward(self, cls_sparse_tensor):
+        """
+        Args:
+            cls_sparse_tensor: ME.SparseTensor with occupancy logits in .F, shape (N, 1)
+        Returns:
+            tv_loss: scalar TV loss value
+        """
+        prob = torch.sigmoid(cls_sparse_tensor.F)
+
+        # Create new SparseTensor with probability features (reuse coordinate mapping)
+        prob_st = ME.SparseTensor(
+            features=prob,
+            coordinate_map_key=cls_sparse_tensor.coordinate_map_key,
+            coordinate_manager=cls_sparse_tensor.coordinate_manager,
+        )
+
+        # Compute 3x3x3 neighborhood average (including self)
+        # In sparse conv: neighbor_avg = (1/27)*self_prob + (1/27)*sum_neighbor_probs
+        neighbor_avg = self.tv_conv(prob_st)
+
+        # Laplacian: avg_26_neighbors - self_prob
+        # When all 26 neighbors exist:
+        #   avg_26 = (27*avg_27 - self_prob) / 26
+        #   laplacian = avg_26 - self_prob = (avg_27 - self_prob) * 27 / 26
+        # When some neighbors are missing (sparse boundary):
+        #   laplacian is slightly conservative (under-weights missing neighbors)
+        #   This is desired behavior — less regularization at sparse boundaries
+        laplacian = (neighbor_avg.F - prob) * (27.0 / 26.0)
+
+        tv_loss = laplacian.abs().mean()
+
+        return tv_loss
+
+
 class Visualizer:
     def __init__(self, net, dataloader, device, config):
         self.train_iter = iter(dataloader)
@@ -905,9 +961,11 @@ class Visualizer:
         
         self.crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
         self.crit2 = nn.BCEWithLogitsLoss().to(device)
-        
+        self.crit3 = MinkowskiTVLoss().to(device)
+
         self.voxel_coef = config.voxel_coef
         self.chamfer_coef = config.chamfer_coef
+        self.tv_coef = config.tv_coef
         
         self.M = np.eye(3)
         
@@ -1142,10 +1200,20 @@ class Visualizer:
             batch_bce_loss += curr_layer_loss
         voxel_cls_loss = batch_bce_loss / len(out_cls)
 
+        # TV Loss
+        batch_tv_loss = 0
+        layer_tv_losses = []
+        for out_cl in out_cls:
+            curr_tv_loss = self.crit3(out_cl)
+            layer_tv_losses.append(curr_tv_loss.item())
+            batch_tv_loss += curr_tv_loss
+        tv_loss = batch_tv_loss / len(out_cls)
+
         # 总 Loss
-        total_loss = self.voxel_coef * voxel_cls_loss + self.chamfer_coef * points_reg_loss
+        total_loss = self.voxel_coef * voxel_cls_loss + self.chamfer_coef * points_reg_loss + self.tv_coef * tv_loss
         print(f"points_reg_loss: {points_reg_loss}")
         print(f"voxel_cls_loss: {voxel_cls_loss}")
+        print(f"tv_loss: {tv_loss} (layer: {layer_tv_losses})")
         print(f"layer_losses: {layer_losses}")
         print(f"total_loss: {total_loss}\n")
 
@@ -1631,12 +1699,14 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
     
     crit1 = ChamferDistanceLoss(config.chamfer_p_coef, config.chamfer_r_coef).to(device)
     crit2 = nn.BCEWithLogitsLoss().to(device)
-    
+    crit3 = MinkowskiTVLoss().to(device)
+
     net.train()
     train_iter = iter(dataloader)
-    
+
     voxel_coef = config.voxel_coef
     chamfer_coef = config.chamfer_coef
+    tv_coef = config.tv_coef
     
     train_steps = start_step
     data_time = 0
@@ -1654,6 +1724,7 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
         step_total_losses = []
         step_cls_losses = []
         step_reg_losses = []
+        step_tv_losses = []
 
         optimizer.zero_grad()
 
@@ -1761,8 +1832,18 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             voxel_cls_loss = batch_bce_loss / len(out_cls)
             step_cls_losses.append(voxel_cls_loss.item())
 
+            # TV Loss
+            batch_tv_loss = 0
+            layer_tv_losses = []
+            for out_cl in out_cls:
+                curr_tv_loss = crit3(out_cl)
+                layer_tv_losses.append(curr_tv_loss.item())
+                batch_tv_loss += curr_tv_loss
+            tv_loss = batch_tv_loss / len(out_cls)
+            step_tv_losses.append(tv_loss.item())
+
             # 总 Loss
-            total_loss = voxel_coef * voxel_cls_loss + chamfer_coef * points_reg_loss
+            total_loss = voxel_coef * voxel_cls_loss + chamfer_coef * points_reg_loss + tv_coef * tv_loss
             (total_loss / num_frames).backward()
 
             # 记录 Loss
@@ -1771,8 +1852,11 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             writer.add_scalar('Loss/Total_Step_Loss', total_loss.item(), train_steps)
             writer.add_scalar('Loss/Points_Reg_Loss', points_reg_loss.item(), train_steps)
             writer.add_scalar('Loss/Voxel_Cls_Loss', voxel_cls_loss.item(), train_steps)
+            writer.add_scalar('Loss/TV_Loss', tv_loss.item(), train_steps)
             for layer_idx, loss_val in enumerate(layer_losses):
                 writer.add_scalar(f'Loss/Layer{layer_idx+1}_Cls_Loss', loss_val, train_steps)
+            for layer_idx, tv_val in enumerate(layer_tv_losses):
+                writer.add_scalar(f'Loss/Layer{layer_idx+1}_TV_Loss', tv_val, train_steps)
 
         # 多帧 loss 累积后统一迭代一次
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=config.max_norm)
@@ -1789,11 +1873,13 @@ def train(net, dataloader, optimizer, scheduler, start_iter, start_step, device,
             steps_total_losses_str = ", ".join([f"{v:.3e}" for v in step_total_losses])
             step_cls_losses_str = ", ".join([f"{v:.3e}" for v in step_cls_losses])
             step_reg_losses_str = ", ".join([f"{v:.3e}" for v in step_reg_losses])
+            step_tv_losses_str = ", ".join([f"{v:.3e}" for v in step_tv_losses])
             logging.info(
                 f"Iter: {iter_idx}, Iter Ave Loss: {iter_loss:.3e}, Step: {train_steps}, Data Loading Time: {data_time:.3e}, Total Time: {total_time:.3e}\n"
                 f"Step Total Losses: [{steps_total_losses_str}]\n"
                 f"Step Cls Losses: [{step_cls_losses_str}]\n"
                 f"Step Reg Losses: [{step_reg_losses_str}]\n"
+                f"Step TV Losses: [{step_tv_losses_str}]\n"
             )
 
         if iter_idx % config.save_freq_iter == 0:
