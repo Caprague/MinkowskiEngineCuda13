@@ -82,7 +82,7 @@ parser.add_argument("--tv_coef",            type=float,                 default=
 parser.add_argument("--tv_mode",            type=str,                   default="6",    help="TV mode: 27 (3x3x3), 6 (face-only)")
 parser.add_argument("--max_norm",           type=float,                 default=1.0)
 parser.add_argument("--num_workers",        type=int,                   default=4)
-parser.add_argument("--log_dir",            type=str,                   default="./output/logs")
+parser.add_argument("--log_dir",            type=str,                   default="./output/logs_completion_x128")
 parser.add_argument("--save_dir",           type=str,                   default="./output/checkpoint")
 parser.add_argument("--model_name",         type=str,                   default="lidar_completion_x128_v1")
 parser.add_argument("--load_optimizer",     type=str,                   default=True)

@@ -152,9 +152,10 @@ logging.basicConfig(
 parser = argparse.ArgumentParser()
 # -- 补全网络配置 (用于加载预训练权重) --
 parser.add_argument("--completion_resolution", type=int, default=64)
-parser.add_argument("--completion_checkpoint", type=str, required=True,
+parser.add_argument("--completion_checkpoint", type=str, 
+                    default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/export/model.pth',
                     help="预训练 LidarCompletionNet 的 checkpoint 路径")
-parser.add_argument("--completion_activeF",    type=float, default=0.35)
+parser.add_argument("--completion_activeF",    type=float, default=0.05)
 parser.add_argument("--freeze_completion",     type=bool,  default=True,
                     help="是否冻结补全网络参数")
 
@@ -169,32 +170,33 @@ parser.add_argument("--k_neighbors",           type=int,   default=16,
                     help="每个查询点最近邻数量")
 parser.add_argument("--hidden_dim",            type=int,   default=64,
                     help="轻量网络隐藏层维度")
-parser.add_argument("--samples_per_frame",     type=int,   default=4,
+parser.add_argument("--samples_per_frame",     type=int,   default=8,
                     help="每帧点云模拟的采样次数")
 parser.add_argument("--position_jitter",       type=float, default=0.15,
                     help="机器人水平位置随机扰动范围 (归一化坐标)")
 parser.add_argument("--max_nn_dist",           type=float, default=0.08,
                     help="真值近邻采样最大有效距离 (归一化坐标)")
 
+# -- 补全网络通道配置 (需与训练时的 checkpoint 匹配) --
+ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
+DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
+
+
 # -- 训练配置 --
-parser.add_argument("--max_iter",              type=int,   default=30001)
+parser.add_argument("--max_iter",              type=int,   default=5001)
 parser.add_argument("--stat_freq_iter",        type=int,   default=50)
-parser.add_argument("--save_freq_iter",        type=int,   default=5000)
+parser.add_argument("--save_freq_iter",        type=int,   default=100)
 parser.add_argument("--batch_size",            type=int,   default=4)
 parser.add_argument("--lr",                    type=float, default=1e-3)
 parser.add_argument("--weight_decay",          type=float, default=1e-4)
 parser.add_argument("--max_norm",              type=float, default=1.0)
 parser.add_argument("--num_workers",           type=int,   default=4)
-parser.add_argument("--log_dir",               type=str,   default="./output/logs_heightmap")
+parser.add_argument("--log_dir",               type=str,   default="./output/logs_heightmap_x64")
 parser.add_argument("--save_dir",              type=str,   default="./output/checkpoint")
 parser.add_argument("--model_name",            type=str,   default="heightmap_sampler_v1")
 parser.add_argument("--resume",                action="store_true")
 parser.add_argument("--eval",                  action="store_true")
 parser.add_argument("--max_visualization",     type=int,   default=20)
-
-# -- 补全网络通道配置 (需与训练时的 checkpoint 匹配) --
-ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
-DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
 
 ###############################################################################
@@ -668,7 +670,7 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
     run_log_dir = os.path.join(config.log_dir, timestamp)
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
-    print(f"TensorBoard logs: {run_log_dir}")
+    print(f"📝 TensorBoard logs: {run_log_dir}")
 
     model_save_path = os.path.join(config.save_dir, config.model_name)
     os.makedirs(model_save_path, exist_ok=True)
