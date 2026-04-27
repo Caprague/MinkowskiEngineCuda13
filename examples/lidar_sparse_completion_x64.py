@@ -242,6 +242,44 @@ def make_data_loader(phase, batch_size, shuffle, num_workers, repeat, config, au
 
 
 @torch.jit.script
+def normalize(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """Normalizes a given input tensor to unit length.
+
+    Args:
+        x: Input tensor of shape (N, dims).
+        eps: A small value to avoid division by zero. Defaults to 1e-9.
+
+    Returns:
+        Normalized tensor of shape (N, dims).
+    """
+    return x / x.norm(p=2, dim=-1).clamp(min=eps, max=None).unsqueeze(-1)
+
+
+@torch.jit.script
+def yaw_quat(quat: torch.Tensor) -> torch.Tensor:
+    """Extract the yaw component of a quaternion.
+
+    Args:
+        quat: The orientation in (w, x, y, z). Shape is (..., 4)
+
+    Returns:
+        A quaternion with only yaw component.
+    """
+    shape = quat.shape
+    quat_yaw = quat.view(-1, 4)
+    qw = quat_yaw[:, 0]
+    qx = quat_yaw[:, 1]
+    qy = quat_yaw[:, 2]
+    qz = quat_yaw[:, 3]
+    yaw = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    quat_yaw = torch.zeros_like(quat_yaw)
+    quat_yaw[:, 3] = torch.sin(yaw / 2)
+    quat_yaw[:, 0] = torch.cos(yaw / 2)
+    quat_yaw = normalize(quat_yaw)
+    return quat_yaw.view(shape)
+
+
+@torch.jit.script
 def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
     """Convert rotations given as quaternions to rotation matrices.
 
@@ -365,9 +403,11 @@ def points_transform_and_normclip(points_prev_list: list[torch.Tensor],
     points_prev = pad_sequence(points_prev_list, batch_first=True, padding_value=float('inf'))  # (N, P, 3)
     points_prev -= 0.5                                                                          # (0, 1) -> (-0.5, +0.5)
     
-    rot_matrix_curr = matrix_from_quat(quat_curr)                                               # (N, 4) -> (N, 3, 3)
+    quat_curr_yaw = yaw_quat(quat_curr)                                                         # (N, 4)
+    rot_matrix_curr = matrix_from_quat(quat_curr_yaw)                                           # (N, 4) -> (N, 3, 3)
 
-    points_world_prev = transform_points(points_prev * scale, pos_prev, quat_prev)              # (N, P, 3)
+    quat_prev_yaw = yaw_quat(quat_prev)                                                         # (N, 4)
+    points_world_prev = transform_points(points_prev * scale, pos_prev, quat_prev_yaw)          # (N, P, 3)
     points_world_prev_centered = points_world_prev - pos_curr.unsqueeze(1)                      # (N, P, 3)
     
     points_prev_view = torch.matmul(points_world_prev_centered, rot_matrix_curr)                # (N, P, 3)
