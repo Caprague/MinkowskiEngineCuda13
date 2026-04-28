@@ -411,7 +411,14 @@ class HeightMapSampler(nn.Module):
 ###############################################################################
 
 class HeightmapVisualizer:
-    """高度图结果可视化工具 (基于 Open3D)。"""
+    """高度图结果可视化工具 (基于 Open3D)。
+
+    布局说明:
+      左上: 真值稠密地形 + 红色高程采样点 (叠加)
+      右上: 恢复地形 + 青色高程采样点 (叠加)
+      左下: 输入 (残缺)
+      右下: 预测高度图 (单独参考)
+    """
 
     def __init__(self, completion_net, sampler_net, dataloader, device, config):
         self.completion_net = completion_net
@@ -438,21 +445,26 @@ class HeightmapVisualizer:
         self.robot_norm_pos = torch.tensor([0.5, 0.5], device=device, dtype=torch.float32)
 
         print("\n高度图可视化布局:")
-        print(" 红: 输入 (残缺) | 绿: 补全恢复")
-        print(" 黄: 真值高度图  | 青: 预测高度图")
+        print(" 左上: 真值地形(黄) + 采样点(红)")
+        print(" 右上: 恢复地形(绿) + 采样点(青)")
+        print(" 左下: 输入(残缺) | 右下: 预测高度图(参考)")
 
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(window_name="HeightMap Viewer", width=1400, height=900, left=0, top=0)
         opt = self.vis.get_render_option()
-        opt.background_color = np.asarray([0.2, 0.2, 0.2])
-        opt.point_size = 4.0
+        opt.background_color = np.asarray([0.15, 0.15, 0.15])
+        opt.point_size = 3.5
 
-        self.in_pcd = o3d.geometry.PointCloud()
-        self.rec_pcd = o3d.geometry.PointCloud()
-        self.gt_hm_pcd = o3d.geometry.PointCloud()
-        self.pred_hm_pcd = o3d.geometry.PointCloud()
+        # 6 组点云几何体
+        self.in_pcd = o3d.geometry.PointCloud()          # 左下: 输入
+        self.gt_terrain_pcd = o3d.geometry.PointCloud()  # 左上: 真值地形 (底色)
+        self.gt_samples_pcd = o3d.geometry.PointCloud()  # 左上: 真值采样点 (叠加)
+        self.rec_terrain_pcd = o3d.geometry.PointCloud() # 右上: 恢复地形 (底色)
+        self.pred_samples_pcd = o3d.geometry.PointCloud()# 右上: 预测采样点 (叠加)
+        self.pred_hm_pcd = o3d.geometry.PointCloud()     # 右下: 预测高度图单独参考
 
-        for geo in (self.in_pcd, self.rec_pcd, self.gt_hm_pcd, self.pred_hm_pcd):
+        for geo in (self.in_pcd, self.gt_terrain_pcd, self.gt_samples_pcd,
+                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd):
             self.vis.add_geometry(geo)
 
         self.vis.register_key_callback(ord("N"), self.render_sample)
@@ -579,11 +591,11 @@ class HeightmapVisualizer:
             gt_points, grid_xy, max_dist=self.config.max_nn_dist
         )
 
-        # 构建可视化点云 (x, y, z)
+        # 构建采样点坐标 (x, y, z)
         pred_pcd_pts = torch.cat([grid_xy, pred_h.unsqueeze(-1)], dim=1).cpu().numpy()
         gt_pcd_pts = torch.cat([grid_xy, gt_h.unsqueeze(-1)], dim=1).cpu().numpy()
 
-        # 颜色: 根据高度着色
+        # 统一高度范围着色 (仅用于右下角的独立预测高度图)
         def color_by_height(pts, z_min=None, z_max=None):
             z = pts[:, 2]
             if z_min is None:
@@ -599,30 +611,54 @@ class HeightmapVisualizer:
         z_min = min(pred_pcd_pts[:, 2].min(), gt_pcd_pts[:, 2].min())
         z_max = max(pred_pcd_pts[:, 2].max(), gt_pcd_pts[:, 2].max())
 
-        # 输入点云 (红色)
+        # ---- 左下: 输入点云 (暗红色) ----
         in_pc = t_p_points_list[0].cpu().numpy()
         self.in_pcd.points = o3d.utility.Vector3dVector(in_pc)
-        self.in_pcd.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.0, 0.0], (len(in_pc), 1)))
+        self.in_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.8, 0.2, 0.2], (len(in_pc), 1)))
+        self.in_pcd.estimate_normals()
 
-        # 恢复点云 (绿色)
-        self.rec_pcd.points = o3d.utility.Vector3dVector(rec_points.cpu().numpy())
-        self.rec_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.0, 1.0, 0.0], (len(rec_points), 1)))
+        # ---- 左上: 真值稠密地形 (暗黄色底色) + 真值采样点 (亮红色叠加) ----
+        gt_pc = gt_points.cpu().numpy()
+        self.gt_terrain_pcd.points = o3d.utility.Vector3dVector(gt_pc)
+        self.gt_terrain_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.7, 0.7, 0.3], (len(gt_pc), 1)))
+        self.gt_terrain_pcd.estimate_normals()
 
-        # 真值高度图 (左上，高度着色)
-        self.gt_hm_pcd.points = o3d.utility.Vector3dVector(gt_pcd_pts)
-        self.gt_hm_pcd.colors = o3d.utility.Vector3dVector(color_by_height(gt_pcd_pts, z_min, z_max))
+        self.gt_samples_pcd.points = o3d.utility.Vector3dVector(gt_pcd_pts)
+        self.gt_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.05, 0.05], (len(gt_pcd_pts), 1)))
+        self.gt_samples_pcd.estimate_normals()
 
-        # 预测高度图 (右上，高度着色)
+        # ---- 右上: 恢复地形 (暗绿色底色) + 预测采样点 (亮青色叠加) ----
+        rec_pc = rec_points.cpu().numpy()
+        self.rec_terrain_pcd.points = o3d.utility.Vector3dVector(rec_pc)
+        self.rec_terrain_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.3, 0.7, 0.3], (len(rec_pc), 1)))
+        self.rec_terrain_pcd.estimate_normals()
+
+        self.pred_samples_pcd.points = o3d.utility.Vector3dVector(pred_pcd_pts)
+        self.pred_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.05, 0.9, 1.0], (len(pred_pcd_pts), 1)))
+        self.pred_samples_pcd.estimate_normals()
+
+        # ---- 右下: 预测高度图单独参考 (高度着色) ----
         self.pred_hm_pcd.points = o3d.utility.Vector3dVector(pred_pcd_pts)
         self.pred_hm_pcd.colors = o3d.utility.Vector3dVector(color_by_height(pred_pcd_pts, z_min, z_max))
+        self.pred_hm_pcd.estimate_normals()
 
-        # 平移布局 (使用 relative=False 避免累积漂移)
+        # ---- 平移布局 (relative=False 避免累积漂移) ----
+        # 左上: 真值地形 + 采样叠加
+        self.gt_terrain_pcd.translate([-0.6, 0.6, 0.0], relative=False)
+        self.gt_samples_pcd.translate([-0.6, 0.6, 0.0], relative=False)
+
+        # 右上: 恢复地形 + 采样叠加
+        self.rec_terrain_pcd.translate([0.6, 0.6, 0.0], relative=False)
+        self.pred_samples_pcd.translate([0.6, 0.6, 0.0], relative=False)
+
+        # 左下: 输入
         self.in_pcd.translate([-0.6, -0.6, 0.0], relative=False)
-        self.rec_pcd.translate([0.6, -0.6, 0.0], relative=False)
-        self.gt_hm_pcd.translate([-0.6, 0.6, 0.0], relative=False)
-        self.pred_hm_pcd.translate([0.6, 0.6, 0.0], relative=False)
 
-        for geo in (self.in_pcd, self.rec_pcd, self.gt_hm_pcd, self.pred_hm_pcd):
+        # 右下: 预测高度图参考
+        self.pred_hm_pcd.translate([0.6, -0.6, 0.0], relative=False)
+
+        for geo in (self.in_pcd, self.gt_terrain_pcd, self.gt_samples_pcd,
+                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd):
             self.vis.update_geometry(geo)
 
         # 打印误差
