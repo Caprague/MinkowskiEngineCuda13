@@ -159,7 +159,7 @@ parser.add_argument("--completion_resolution", type=int, default=64)
 parser.add_argument("--completion_checkpoint", type=str, 
                     default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/export/model.pth',
                     help="预训练 LidarCompletionNet 的 checkpoint 路径")
-parser.add_argument("--completion_activeF",    type=float, default=0.05)
+parser.add_argument("--completion_activeF",    type=float, default=0.35)
 parser.add_argument("--freeze_completion",     type=bool,  default=True,
                     help="是否冻结补全网络参数")
 
