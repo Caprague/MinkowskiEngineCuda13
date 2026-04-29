@@ -171,7 +171,7 @@ parser.add_argument("--phys_scale",             type=float,     default=3.2,
                     help="归一化坐标与物理尺度的换算系数: 1.0 (norm) = phys_scale (m)")
 parser.add_argument("--k_neighbors",            type=int,       default=8,
                     help="每个查询点最近邻数量")
-parser.add_argument("--hidden_dim",             type=int,       default=256,
+parser.add_argument("--hidden_dim",             type=int,       default=512,
                     help="轻量网络隐藏层维度")
 parser.add_argument("--samples_per_frame",      type=int,       default=8,
                     help="每帧点云模拟的采样次数")
