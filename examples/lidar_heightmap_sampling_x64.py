@@ -47,8 +47,9 @@
    轻量 PointNet 风格的 k-NN 查询网络，参数量约 ~0.03M：
 
    - Point Encoder: 3 → hidden_dim → hidden_dim 逐点编码恢复出的点云
-   - Local MLP: 对每个网格查询点，找 XY 平面 k-NN 邻居，拼接 rel_xyz(3) + feat(hidden_dim) → MaxPool 聚合
-   - Query MLP: local_feat + query_xy(2) → hidden_dim → hidden_dim/2 → 1 输出预测高度
+   - Local MLP: 对每个网格查询点，找 XY 平面 k-NN 邻居，拼接 rel_xyz(3) + feat(hidden_dim) → 距离倒数加权聚合
+   - Query MLP: local_feat + query_xy(2) + height_stats(4) → hidden_dim → hidden_dim/2 → 1 输出预测高度
+   - height_stats = [z_mean, z_min, z_max, z_std] 来自 k-NN 邻居，显式提供边缘锐利信息
 
    2. 网格采样 (generate_grid_xy + sample_heightmap_from_points)
 
@@ -86,7 +87,7 @@
    ├─────────────────────┼─────────┼──────────────────────────────┤
    │ --grid_res_phys     │ 0.1     │ 网格物理分辨率 (m)              │
    │ --grid_size_phys    │ 1.6 1.0 │ 网格物理尺寸 (m)               │
-   │ --k_neighbors       │ 16      │ 每个查询点的 k-NN 数            │
+   │ --k_neighbors       │ 8       │ 每个查询点的 k-NN 数            │
    │ --hidden_dim        │ 64      │ 网络隐藏维度                    │
    │ --samples_per_frame │ 8       │ 每帧模拟采样次数                │
    │ --max_nn_dist       │ 0.08    │ 真值近邻最大有效距离 (归一化)    │
@@ -168,7 +169,7 @@ parser.add_argument("--grid_size_phys",         type=float,     default=[1.6, 1.
                     help="网格物理尺寸 [长, 宽] (米)")
 parser.add_argument("--phys_scale",             type=float,     default=3.2,
                     help="归一化坐标与物理尺度的换算系数: 1.0 (norm) = phys_scale (m)")
-parser.add_argument("--k_neighbors",            type=int,       default=16,
+parser.add_argument("--k_neighbors",            type=int,       default=8,
                     help="每个查询点最近邻数量")
 parser.add_argument("--hidden_dim",             type=int,       default=256,
                     help="轻量网络隐藏层维度")
@@ -332,6 +333,44 @@ def sample_heightmap_from_points(points, grid_xy, max_dist=None):
     return heights, valid_mask
 
 
+def build_grid_lines(grid_xy, heights, nx, ny):
+    """
+    构建网格线的 LineSet 几何体，连接相邻采样点。
+
+    Args:
+        grid_xy:  (M, 2) 网格 XY 坐标
+        heights:  (M,)   高度值
+        nx:       x 方向网格数
+        ny:       y 方向网格数
+
+    Returns:
+        points: (P, 3) 线段端点坐标
+        lines:  (L, 2) 线段端点索引对
+    """
+    M = grid_xy.shape[0]
+    z = heights.cpu().numpy().reshape(nx, ny)
+    xy = grid_xy.cpu().numpy().reshape(nx, ny, 2)
+
+    points_3d = np.concatenate([xy, z[:, :, None]], axis=-1)  # (nx, ny, 3)
+    flat_points = points_3d.reshape(-1, 3)
+
+    lines = []
+    # x 方向连线
+    for i in range(nx):
+        for j in range(ny - 1):
+            idx0 = i * ny + j
+            idx1 = i * ny + j + 1
+            lines.append([idx0, idx1])
+    # y 方向连线
+    for i in range(nx - 1):
+        for j in range(ny):
+            idx0 = i * ny + j
+            idx1 = (i + 1) * ny + j
+            lines.append([idx0, idx1])
+
+    return flat_points, np.array(lines, dtype=np.int32) if lines else np.zeros((0, 2), dtype=np.int32)
+
+
 ###############################################################################
 # End of grid sampling utilities
 ###############################################################################
@@ -351,7 +390,7 @@ class HeightMapSampler(nn.Module):
 
     def __init__(
         self,
-        k: int = 16,
+        k: int = 8,
         hidden_dim: int = 64,
         grid_res: float = 0.03125,
         grid_size: tuple = (0.5, 0.3125),
@@ -377,9 +416,10 @@ class HeightMapSampler(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 查询解码器: [pooled_local(hidden_dim), query_xy(2)] -> 1 (height)
+        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), height_stats(4)] -> 1 (height)
+        # height_stats = [z_mean, z_min, z_max, z_std] 来自 k-NN 邻居
         self.query_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 2, hidden_dim),
+            nn.Linear(hidden_dim + 2 + 4, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
@@ -411,13 +451,13 @@ class HeightMapSampler(nn.Module):
         p_feats = self.point_encoder(points)  # (N, hidden_dim)
 
         # 3. XY 平面 k-NN 搜索
+        dists = torch.cdist(grid_xy, points[:, :2])  # (M, N) — 始终计算，后续加权聚合复用
         k_actual = min(self.k, points.shape[0])
         if points.shape[0] <= k_actual:
             # 点过少时全部复制
             nn_idx = torch.arange(points.shape[0], device=points.device).unsqueeze(0).expand(M, -1)
             k_actual = points.shape[0]
         else:
-            dists = torch.cdist(grid_xy, points[:, :2])  # (M, N)
             _, nn_idx = torch.topk(dists, k_actual, largest=False, dim=1)  # (M, k_actual)
 
         # 4. 聚合局部邻居特征
@@ -433,10 +473,23 @@ class HeightMapSampler(nn.Module):
 
         local_input = torch.cat([rel_pos, neighbor_feats], dim=-1)  # (M, k_actual, 3+hidden)
         local_output = self.local_mlp(local_input)                   # (M, k_actual, hidden)
-        local_feat = local_output.max(dim=1)[0]                      # (M, hidden)
+
+        # 距离倒数加权聚合 (替代 MaxPool，保留距离近的邻居贡献更大，有利于阶梯锐利边缘)
+        nn_dists = torch.gather(dists, 1, nn_idx)                    # (M, k_actual)
+        inv_weights = 1.0 / (nn_dists + 1e-6)                       # (M, k_actual)
+        inv_weights = inv_weights / inv_weights.sum(dim=1, keepdim=True)  # 归一化
+        local_feat = (local_output * inv_weights.unsqueeze(-1)).sum(dim=1)  # (M, hidden)
+
+        # 邻居高度统计特征 (z_mean, z_min, z_max, z_std) — 显式提供边缘信息
+        neighbor_z = neighbor_pts[:, :, 2]                           # (M, k_actual)
+        z_mean = neighbor_z.mean(dim=1)
+        z_min = neighbor_z.min(dim=1)[0]
+        z_max = neighbor_z.max(dim=1)[0]
+        z_std = neighbor_z.std(dim=1).clamp(max=2.0)
+        height_stats = torch.stack([z_mean, z_min, z_max, z_std], dim=-1)  # (M, 4)
 
         # 5. 全局查询解码
-        query_input = torch.cat([local_feat, grid_xy], dim=-1)  # (M, hidden+2)
+        query_input = torch.cat([local_feat, grid_xy, height_stats], dim=-1)  # (M, hidden+2+4)
         pred_heights = self.query_mlp(query_input).squeeze(-1)       # (M,)
 
         return pred_heights, grid_xy, nx, ny
@@ -485,13 +538,14 @@ class HeightmapVisualizer:
         # 历史帧缓存 (对齐 lidar_sparse_completion_x64 的 Visualizer 逻辑)
         self.prev_frame_data = [None] * 1  # batch_size=1 for visualization
 
-        # 固定可视化用的采样中心与朝向
-        self.vis_center = torch.tensor([0.5, 0.5], device=device, dtype=torch.float32)
-        self.vis_yaw = 0.0
+        # 归一化网格参数 (用于 sample_random_center)
+        self.grid_res = config.grid_res_phys / config.phys_scale
+        self.grid_size = (config.grid_size_phys[0] / config.phys_scale,
+                          config.grid_size_phys[1] / config.phys_scale)
 
         print("\n高度图可视化布局:")
-        print(" 左上: 真值地形(黄) + 采样点(红)")
-        print(" 右上: 恢复地形(绿) + 采样点(青)")
+        print(" 左上: 真值地形(黄) + 采样点(红) + 网格线(暗红)")
+        print(" 右上: 恢复地形(绿) + 采样点(青) + 网格线(暗青)")
         print(" 左下: 输入(残缺) | 右下: 预测高度图(参考)")
 
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
@@ -508,8 +562,13 @@ class HeightmapVisualizer:
         self.pred_samples_pcd = o3d.geometry.PointCloud()# 右上: 预测采样点 (叠加)
         self.pred_hm_pcd = o3d.geometry.PointCloud()     # 右下: 预测高度图单独参考
 
+        # 2 组 LineSet 网格线几何体
+        self.gt_grid_lines = o3d.geometry.LineSet()      # 左上: 真值网格线
+        self.pred_grid_lines = o3d.geometry.LineSet()    # 右上: 预测网格线
+
         for geo in (self.in_pcd, self.gt_terrain_pcd, self.gt_samples_pcd,
-                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd):
+                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd,
+                    self.gt_grid_lines, self.pred_grid_lines):
             self.vis.add_geometry(geo)
 
         self.vis.register_key_callback(ord("N"), self.render_sample)
@@ -674,8 +733,12 @@ class HeightmapVisualizer:
         rec_points = sout_points_norm_list[0]          # (N, 3)
         gt_points = t_c_points_list[0]                 # (M, 3)
 
+        # 每帧随机采样中心与朝向 (与训练一致)
+        vis_center = sample_random_center(self.grid_size, margin=0.05, device=self.device)
+        vis_yaw = torch.rand(1, device=self.device).item() * 2.0 * np.pi
+
         with torch.no_grad():
-            pred_h, grid_xy, nx, ny = self.sampler_net(rec_points, self.vis_center, yaw=self.vis_yaw)
+            pred_h, grid_xy, nx, ny = self.sampler_net(rec_points, vis_center, yaw=vis_yaw)
 
         gt_h, gt_valid = sample_heightmap_from_points(
             gt_points, grid_xy, max_dist=self.config.max_nn_dist
@@ -715,7 +778,19 @@ class HeightmapVisualizer:
 
         self.gt_samples_pcd.points = o3d.utility.Vector3dVector(gt_pcd_pts)
         self.gt_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.05, 0.05], (len(gt_pcd_pts), 1)))
+        # 放大采样点体积: 3D 均匀膨胀使采样点更显眼
+        gt_pcd_inflated = gt_pcd_pts.copy()
+        gt_center = gt_pcd_inflated.mean(axis=0)
+        gt_pcd_inflated = gt_center + (gt_pcd_inflated - gt_center) * 1.3
+        self.gt_samples_pcd.points = o3d.utility.Vector3dVector(gt_pcd_inflated)
         self.gt_samples_pcd.estimate_normals()
+
+        # 真值网格线 (暗红色)
+        gt_line_pts, gt_line_idx = build_grid_lines(grid_xy, gt_h, nx, ny)
+        self.gt_grid_lines.points = o3d.utility.Vector3dVector(gt_line_pts)
+        self.gt_grid_lines.lines = o3d.utility.Vector2iVector(gt_line_idx)
+        gt_line_colors = np.tile([0.7, 0.15, 0.15], (len(gt_line_idx), 1))
+        self.gt_grid_lines.colors = o3d.utility.Vector3dVector(gt_line_colors)
 
         # ---- 右上: 恢复地形 (暗绿色底色) + 预测采样点 (亮青色叠加) ----
         rec_pc = rec_points.cpu().numpy()
@@ -725,7 +800,18 @@ class HeightmapVisualizer:
 
         self.pred_samples_pcd.points = o3d.utility.Vector3dVector(pred_pcd_pts)
         self.pred_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.05, 0.9, 1.0], (len(pred_pcd_pts), 1)))
+        # 放大采样点体积
+        pred_center = pred_pcd_pts.mean(axis=0)
+        pred_pcd_inflated = pred_center + (pred_pcd_pts - pred_center) * 1.3
+        self.pred_samples_pcd.points = o3d.utility.Vector3dVector(pred_pcd_inflated)
         self.pred_samples_pcd.estimate_normals()
+
+        # 预测网格线 (暗青色)
+        pred_line_pts, pred_line_idx = build_grid_lines(grid_xy, pred_h, nx, ny)
+        self.pred_grid_lines.points = o3d.utility.Vector3dVector(pred_line_pts)
+        self.pred_grid_lines.lines = o3d.utility.Vector2iVector(pred_line_idx)
+        pred_line_colors = np.tile([0.1, 0.5, 0.55], (len(pred_line_idx), 1))
+        self.pred_grid_lines.colors = o3d.utility.Vector3dVector(pred_line_colors)
 
         # ---- 右下: 预测高度图单独参考 (高度着色) ----
         self.pred_hm_pcd.points = o3d.utility.Vector3dVector(pred_pcd_pts)
@@ -733,13 +819,15 @@ class HeightmapVisualizer:
         self.pred_hm_pcd.estimate_normals()
 
         # ---- 平移布局 (relative=False 避免累积漂移) ----
-        # 左上: 真值地形 + 采样叠加
+        # 左上: 真值地形 + 采样叠加 + 网格线
         self.gt_terrain_pcd.translate([-0.6, 0.6, 0.0], relative=False)
         self.gt_samples_pcd.translate([-0.6, 0.6, 0.0], relative=False)
+        self.gt_grid_lines.translate([-0.6, 0.6, 0.0], relative=False)
 
-        # 右上: 恢复地形 + 采样叠加
+        # 右上: 恢复地形 + 采样叠加 + 网格线
         self.rec_terrain_pcd.translate([0.6, 0.6, 0.0], relative=False)
         self.pred_samples_pcd.translate([0.6, 0.6, 0.0], relative=False)
+        self.pred_grid_lines.translate([0.6, 0.6, 0.0], relative=False)
 
         # 左下: 输入
         self.in_pcd.translate([-0.6, -0.6, 0.0], relative=False)
@@ -748,7 +836,8 @@ class HeightmapVisualizer:
         self.pred_hm_pcd.translate([0.6, -0.6, 0.0], relative=False)
 
         for geo in (self.in_pcd, self.gt_terrain_pcd, self.gt_samples_pcd,
-                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd):
+                    self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd,
+                    self.gt_grid_lines, self.pred_grid_lines):
             self.vis.update_geometry(geo)
 
         # 打印误差
