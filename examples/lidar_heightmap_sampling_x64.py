@@ -195,7 +195,7 @@ parser.add_argument("--max_norm",              type=float,              default=
 parser.add_argument("--num_workers",           type=int,                default=4)
 parser.add_argument("--log_dir",               type=str,                default="./output/logs_heightmap_x64")
 parser.add_argument("--save_dir",              type=str,                default="./output/checkpoint")
-parser.add_argument("--model_name",            type=str,                default="heightmap_sampler_v1")
+parser.add_argument("--model_name",            type=str,                default="heightmap_sampler_v0")
 parser.add_argument("--max_visualization",     type=int,                default=20)
 parser.add_argument("--resume",                action="store_true")
 parser.add_argument("--eval",                  action="store_true")
