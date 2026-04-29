@@ -25,14 +25,15 @@
 基于预训练稀疏补全网络的轻量化地形高度图重采样网络训练脚本。
 
 功能:
-1. 加载预训练的 LidarCompletionNet，生成恢复后的稠密点云；
+1. 加载预训练的 LidarCompletionNet，融合历史帧恢复点云，生成恢复后的稠密点云；
 2. 在恢复点云后接入轻量的 HeightMapSampler 网络；
 3. 以真值稠密点云为参考，通过 grid_pattern 俯近邻采样获取真值高度图；
-4. 在一帧点云中模拟多次不同水平位置的采样，训练高度图预测网络。
+4. 在一帧点云中模拟多次不同水平位置与朝向的采样，训练高度图预测网络。
 
 输入:
-- 补全网络恢复出的点云 (稀疏/稠密)；
-- 机器人水平位置 (相对于恢复点云中心的偏移)。
+- 补全网络恢复出的点云 (稀疏/稠密，含历史帧融合)；
+- 采样网格中心位置 (自适应随机采样)；
+- 采样网格朝向 (随机 yaw 旋转)。
 
 输出:
 - 固定分辨率网格上的高度值 (Z)，构成矩形点阵。
@@ -47,48 +48,50 @@
 
    - Point Encoder: 3 → hidden_dim → hidden_dim 逐点编码恢复出的点云
    - Local MLP: 对每个网格查询点，找 XY 平面 k-NN 邻居，拼接 rel_xyz(3) + feat(hidden_dim) → MaxPool 聚合
-   - Query MLP: local_feat + query_xy(2) + robot_rel(2) → hidden_dim → hidden_dim/2 → 1 输出预测高度
+   - Query MLP: local_feat + query_xy(2) → hidden_dim → hidden_dim/2 → 1 输出预测高度
 
    2. 网格采样 (generate_grid_xy + sample_heightmap_from_points)
 
    - 物理默认: 分辨率 0.1m，尺寸 [1.6m, 1.0m]
    - 通过 --phys_scale=3.2 自动换算到归一化坐标（与 lidar_sparse_completion_x64.py 的 scale=3.2 一致）
+   - 支持 yaw 旋转: 网格坐标先绕中心旋转再平移，训练时 360° 随机增强
    - 真值采样: 对每个网格中心，在 XY 平面找最近邻点，取该点 Z 作为高度真值，支持 max_nn_dist 阈值过滤
 
    3. 训练流程
 
-   - 加载预训练 LidarCompletionNet（默认 冻结）
+   - 加载预训练 LidarCompletionNet（默认冻结）
+   - 历史帧融合: 上一帧恢复点云经 points_transform_and_normclip 变换到当前帧，作为补充输入
    - 每帧点云通过补全网络得到恢复点云
-   - 每帧模拟多次采样: 在机器人位置 [0.5, 0.5]（归一化）附近加入随机 jitter（--position_jitter）
-   - 输入网络: 恢复点云 + query_center + robot_rel
+   - 每帧模拟多次采样: 采样中心由 sample_random_center() 自适应生成，yaw 角度随机
+   - 输入网络: 恢复点云 + center_xy + yaw
    - Loss: 仅对有效网格计算 L1 Loss
 
    4. 配置与运行
      1 # 训练
-     2 python examples/lidar_heightmap_sampling.py \
+     2 python examples/lidar_heightmap_sampling_x64.py \
      3     --completion_checkpoint ./output/checkpoint/lidar_completion_x64_v2/model_30000.pth \
      4     --completion_resolution 64 \
      5     --batch_size 4 \
-     6     --samples_per_frame 4 \
+     6     --samples_per_frame 8 \
      7     --grid_res_phys 0.1 \
      8     --grid_size_phys 1.6 1.0
-     9
+
     10 # 可视化评估
-    11 python examples/lidar_heightmap_sampling.py \
+    11 python examples/lidar_heightmap_sampling_x64.py \
     12     --completion_checkpoint ./output/checkpoint/lidar_completion_x64_v2/model_30000.pth \
     13     --eval
    5. 关键可调参数
-   ┌─────────────────────┬─────────┬─────────────────────────┐
-   │ 参数                 │ 默认值   │ 说明                    │
-   ├─────────────────────┼─────────┼─────────────────────────┤
-   │ --grid_res_phys     │ 0.1     │ 网格物理分辨率 (m)        │
-   │ --grid_size_phys    │ 1.6 1.0 │ 网格物理尺寸 (m)          │
-   │ --k_neighbors       │ 16      │ 每个查询点的 k-NN 数      │
-   │ --hidden_dim        │ 64      │ 网络隐藏维度              │
-   │ --samples_per_frame │ 4       │ 每帧模拟采样次数          │
-   │ --position_jitter   │ 0.15    │ 机器人位置扰动 (归一化)    │
-   │ --freeze_completion │ True    │ 是否冻结补全网络          │
-   └─────────────────────┴─────────┴─────────────────────────┘
+   ┌─────────────────────┬─────────┬──────────────────────────────┐
+   │ 参数                 │ 默认值   │ 说明                          │
+   ├─────────────────────┼─────────┼──────────────────────────────┤
+   │ --grid_res_phys     │ 0.1     │ 网格物理分辨率 (m)              │
+   │ --grid_size_phys    │ 1.6 1.0 │ 网格物理尺寸 (m)               │
+   │ --k_neighbors       │ 16      │ 每个查询点的 k-NN 数            │
+   │ --hidden_dim        │ 64      │ 网络隐藏维度                    │
+   │ --samples_per_frame │ 8       │ 每帧模拟采样次数                │
+   │ --max_nn_dist       │ 0.08    │ 真值近邻最大有效距离 (归一化)    │
+   │ --freeze_completion │ True    │ 是否冻结补全网络                │
+   └─────────────────────┴─────────┴──────────────────────────────┘
    如需调整网络结构（例如加入 2D CNN 分支、改用 attention 聚合、或增加 valid mask 预测头），可以直接修改 HeightMapSampler 类。
 
 """
@@ -132,6 +135,7 @@ from lidar_sparse_completion_x64 import (
     voxelization,
     devoxelization,
     compute_feats,
+    points_transform_and_normclip,
     StridedSamplingTransform,
     VoxelFilterTransform,
 )
@@ -172,8 +176,6 @@ parser.add_argument("--hidden_dim",            type=int,   default=64,
                     help="轻量网络隐藏层维度")
 parser.add_argument("--samples_per_frame",     type=int,   default=8,
                     help="每帧点云模拟的采样次数")
-parser.add_argument("--position_jitter",       type=float, default=0.15,
-                    help="机器人水平位置随机扰动范围 (归一化坐标)")
 parser.add_argument("--max_nn_dist",           type=float, default=0.08,
                     help="真值近邻采样最大有效距离 (归一化坐标)")
 
@@ -208,15 +210,16 @@ parser.add_argument("--max_visualization",     type=int,   default=20)
 # Grid sampling utilities
 ###############################################################################
 
-def generate_grid_xy(center_xy, grid_size, grid_res, device):
+def generate_grid_xy(center_xy, grid_size, grid_res, device, yaw=0.0):
     """
-    生成以 center_xy 为中心的二维矩形网格坐标。
+    生成以 center_xy 为中心的二维矩形网格坐标，支持绕 z 轴 yaw 旋转。
 
     Args:
         center_xy: (2,) 网格中心在归一化坐标系中的位置
         grid_size: [size_x, size_y] 网格总尺寸 (归一化)
         grid_res:  网格分辨率 (归一化)
         device:    torch device
+        yaw:       绕 z 轴旋转角度 (弧度)，默认 0.0
 
     Returns:
         grid_xy: (M, 2) 所有网格单元中心坐标
@@ -253,8 +256,48 @@ def generate_grid_xy(center_xy, grid_size, grid_res, device):
 
     xx, yy = torch.meshgrid(x, y, indexing="ij")
     grid_xy = torch.stack([xx.flatten(), yy.flatten()], dim=-1)  # (nx*ny, 2)
+
+    # yaw 旋转 (绕 z 轴)
+    if yaw != 0.0:
+        cos_t = np.cos(yaw)
+        sin_t = np.sin(yaw)
+        rot = torch.tensor([[cos_t, -sin_t],
+                            [sin_t,  cos_t]], dtype=torch.float32, device=device)
+        grid_xy = grid_xy @ rot.T
+
     grid_xy = grid_xy + center_xy.unsqueeze(0)
     return grid_xy, nx, ny
+
+
+def sample_random_center(grid_size, margin=0.05, device="cuda"):
+    """
+    根据网格尺寸自适应生成随机采样中心，保证网格大部分落在 [0,1] 范围内。
+
+    Args:
+        grid_size: [size_x, size_y] 网格总尺寸 (归一化)
+        margin:    边界余量
+        device:    torch device
+
+    Returns:
+        center_xy: (2,) 随机中心坐标
+    """
+    size_x, size_y = grid_size
+    min_x = size_x / 2.0 + margin
+    max_x = 1.0 - size_x / 2.0 - margin
+    min_y = size_y / 2.0 + margin
+    max_y = 1.0 - size_y / 2.0 - margin
+
+    if max_x <= min_x:
+        cx = torch.tensor([0.5], device=device, dtype=torch.float32)
+    else:
+        cx = torch.rand(1, device=device, dtype=torch.float32) * (max_x - min_x) + min_x
+
+    if max_y <= min_y:
+        cy = torch.tensor([0.5], device=device, dtype=torch.float32)
+    else:
+        cy = torch.rand(1, device=device, dtype=torch.float32) * (max_y - min_y) + min_y
+
+    return torch.cat([cx, cy])
 
 
 def sample_heightmap_from_points(points, grid_xy, max_dist=None):
@@ -335,25 +378,25 @@ class HeightMapSampler(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), robot_rel(2)] -> 1 (height)
+        # 查询解码器: [pooled_local(hidden_dim), query_xy(2)] -> 1 (height)
         self.query_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 2 + 2, hidden_dim),
+            nn.Linear(hidden_dim + 2, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-    def generate_grid(self, center_xy, device):
+    def generate_grid(self, center_xy, device, yaw=0.0):
         """封装 generate_grid_xy，使用内部存储的 grid_size / grid_res。"""
-        return generate_grid_xy(center_xy, self.grid_size, self.grid_res, device)
+        return generate_grid_xy(center_xy, self.grid_size, self.grid_res, device, yaw=yaw)
 
-    def forward(self, points, center_xy, robot_rel_xy):
+    def forward(self, points, center_xy, yaw=0.0):
         """
         Args:
             points:        (N, 3) 恢复后的点云 (归一化坐标)
             center_xy:     (2,)   采样网格中心 (通常是机器人水平位置)
-            robot_rel_xy:  (2,)   机器人位置相对于点云中心的偏移
+            yaw:           绕 z 轴旋转角度 (弧度)，默认 0.0
 
         Returns:
             pred_heights:  (M,)   预测高度值
@@ -362,7 +405,7 @@ class HeightMapSampler(nn.Module):
             ny:            y 方向网格数
         """
         # 1. 生成查询网格
-        grid_xy, nx, ny = self.generate_grid(center_xy, points.device)
+        grid_xy, nx, ny = self.generate_grid(center_xy, points.device, yaw=yaw)
         M = grid_xy.shape[0]
 
         # 2. 编码输入点云
@@ -394,8 +437,7 @@ class HeightMapSampler(nn.Module):
         local_feat = local_output.max(dim=1)[0]                      # (M, hidden)
 
         # 5. 全局查询解码
-        robot_exp = robot_rel_xy.unsqueeze(0).expand(M, -1)          # (M, 2)
-        query_input = torch.cat([local_feat, grid_xy, robot_exp], dim=-1)  # (M, hidden+4)
+        query_input = torch.cat([local_feat, grid_xy], dim=-1)  # (M, hidden+2)
         pred_heights = self.query_mlp(query_input).squeeze(-1)       # (M,)
 
         return pred_heights, grid_xy, nx, ny
@@ -441,8 +483,12 @@ class HeightmapVisualizer:
         self.is_running = True
         self.last_next_time = time()
 
-        # 固定归一化坐标系下的机器人位置 (robot frame 中心)
-        self.robot_norm_pos = torch.tensor([0.5, 0.5], device=device, dtype=torch.float32)
+        # 历史帧缓存 (对齐 lidar_sparse_completion_x64 的 Visualizer 逻辑)
+        self.prev_frame_data = [None] * 1  # batch_size=1 for visualization
+
+        # 固定可视化用的采样中心与朝向
+        self.vis_center = torch.tensor([0.5, 0.5], device=device, dtype=torch.float32)
+        self.vis_yaw = 0.0
 
         print("\n高度图可视化布局:")
         print(" 左上: 真值地形(黄) + 采样点(红)")
@@ -536,14 +582,22 @@ class HeightmapVisualizer:
         self.last_next_time = time()
 
     def render_frame(self, data_dict, frame_idx):
-        # ---- 数据准备: 当前帧 partial + complete ----
+        # ---- 数据准备: 当前帧 partial + complete + transform ----
         t_p_points_list_np = data_dict["partial"][frame_idx]
         t_c_points_list_np = data_dict["complete"][frame_idx]
+        t_pos_data_list_np = data_dict["pos_data"][frame_idx]
+        t_quat_data_list_np = data_dict["quat_data"][frame_idx]
+        _t_pos_data_list_np = data_dict["pos_data"][(frame_idx - 1) if frame_idx != 0 else 0]
+        _t_quat_data_list_np = data_dict["quat_data"][(frame_idx - 1) if frame_idx != 0 else 0]
 
         t_p_points_list = [torch.from_numpy(p).float().to(self.device) for p in t_p_points_list_np]
         t_c_points_list = [torch.from_numpy(p).float().to(self.device) for p in t_c_points_list_np]
+        t_pos_data_list = [torch.from_numpy(p).float().to(self.device) for p in t_pos_data_list_np]
+        t_quat_data_list = [torch.from_numpy(p).float().to(self.device) for p in t_quat_data_list_np]
+        _t_pos_data_list = [torch.from_numpy(p).float().to(self.device) for p in _t_pos_data_list_np]
+        _t_quat_data_list = [torch.from_numpy(p).float().to(self.device) for p in _t_quat_data_list_np]
 
-        # 体素化
+        # 体素化当前帧
         _, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(
             t_p_points_list, self.config.completion_resolution
         )
@@ -558,8 +612,42 @@ class HeightmapVisualizer:
             prob=1.0,
         )
 
+        all_input_coords = []
+        all_input_feats = []
+        all_input_coords.extend(t_p_coords_voxel_list)
+        all_input_feats.extend(curr_feats_list)
+
+        # ---- 历史帧处理 (对齐 lidar_sparse_completion_x64) ----
+        if frame_idx > 0:
+            prev_points_list = [data[0] for data in self.prev_frame_data if data is not None]
+            prev_probs_list = [data[1] for data in self.prev_frame_data if data is not None]
+
+            transformed_points_list, transformed_probs_list = points_transform_and_normclip(
+                points_prev_list=prev_points_list,
+                pos_curr=torch.stack(t_pos_data_list),
+                quat_curr=torch.stack(t_quat_data_list),
+                pos_prev=torch.stack(_t_pos_data_list),
+                quat_prev=torch.stack(_t_quat_data_list),
+                feats_prev_list=prev_probs_list,
+                scale=3.2,
+                bound=0.5
+            )
+
+            _, hist_float_list, hist_voxel_list, temp_feats_list = voxelization(
+                transformed_points_list, self.config.completion_resolution, transformed_probs_list
+            )
+            hist_feats_list = compute_feats(
+                coords_float_list=hist_float_list,
+                coords_voxel_list=hist_voxel_list,
+                time_encoding=1.0,
+                prob=temp_feats_list
+            )
+
+            all_input_coords[0] = torch.cat([all_input_coords[0], hist_voxel_list[0]], dim=0)
+            all_input_feats[0] = torch.cat([all_input_feats[0], hist_feats_list[0]], dim=0)
+
         batched_input_coords, batched_input_feats = ME.utils.sparse_collate(
-            t_p_coords_voxel_list, curr_feats_list, device=self.device
+            all_input_coords, all_input_feats, device=self.device
         )
         batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(self.device)
 
@@ -574,18 +662,21 @@ class HeightmapVisualizer:
             _, _, sout, occ_probs = self.completion_net(sin_fused, in_target_key)
 
         sout_coords_list, _ = sout.decomposed_coordinates_and_features
-        sout_points_norm_list, _ = devoxelization(
+        sout_points_norm_list, sout_coords_floats_list = devoxelization(
             sout_coords_list, res=self.config.completion_resolution
         )
+
+        # 更新历史帧缓存
+        num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+        occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
+        self.prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
         # ---- 生成高度图并可视化 (仅展示第一项) ----
         rec_points = sout_points_norm_list[0]          # (N, 3)
         gt_points = t_c_points_list[0]                 # (M, 3)
-        cloud_center = rec_points[:, :2].mean(dim=0)
-        robot_rel = self.robot_norm_pos - cloud_center
 
         with torch.no_grad():
-            pred_h, grid_xy, nx, ny = self.sampler_net(rec_points, self.robot_norm_pos, robot_rel)
+            pred_h, grid_xy, nx, ny = self.sampler_net(rec_points, self.vis_center, yaw=self.vis_yaw)
 
         gt_h, gt_valid = sample_heightmap_from_points(
             gt_points, grid_xy, max_dist=self.config.max_nn_dist
@@ -729,8 +820,8 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
     grid_size = [config.grid_size_phys[0] / config.phys_scale,
                  config.grid_size_phys[1] / config.phys_scale]
 
-    # 固定机器人归一化位置 (robot frame 中心为 0.5, 0.5)
-    robot_norm_pos = torch.tensor([0.5, 0.5], device=device, dtype=torch.float32)
+    # 历史帧缓存 (跨帧但跨 sample 时 t=0 不启用，同 lidar_sparse_completion_x64)
+    prev_frame_data = [None] * config.batch_size
 
     beg_iter = start_iter
     end_iter = start_iter + config.max_iter
@@ -748,12 +839,20 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
 
         num_frames = data_dict["num_frames"]
         for t in range(num_frames):
-            # ---- 数据加载: 当前帧 partial + complete ----
+            # ---- 数据加载: 当前帧 partial + complete + transform ----
             t_p_points_list_np = data_dict["partial"][t]
             t_c_points_list_np = data_dict["complete"][t]
+            t_pos_data_list_np = data_dict["pos_data"][t]
+            t_quat_data_list_np = data_dict["quat_data"][t]
+            _t_pos_data_list_np = data_dict["pos_data"][(t - 1) if t != 0 else 0]
+            _t_quat_data_list_np = data_dict["quat_data"][(t - 1) if t != 0 else 0]
 
             t_p_points_list = [torch.from_numpy(p).float().to(device) for p in t_p_points_list_np]
             t_c_points_list = [torch.from_numpy(p).float().to(device) for p in t_c_points_list_np]
+            t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in t_pos_data_list_np]
+            t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in t_quat_data_list_np]
+            _t_pos_data_list = [torch.from_numpy(p).float().to(device) for p in _t_pos_data_list_np]
+            _t_quat_data_list = [torch.from_numpy(p).float().to(device) for p in _t_quat_data_list_np]
 
             # 体素化当前帧
             _, t_p_coords_float_list, t_p_coords_voxel_list, _ = voxelization(
@@ -770,8 +869,43 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
                 prob=1.0,
             )
 
+            all_input_coords = []
+            all_input_feats = []
+            all_input_coords.extend(t_p_coords_voxel_list)
+            all_input_feats.extend(curr_feats_list)
+
+            # ---- 历史帧处理 (对齐 lidar_sparse_completion_x64) ----
+            if t > 0:
+                prev_points_list = [data[0] for data in prev_frame_data if data is not None]
+                prev_probs_list = [data[1] for data in prev_frame_data if data is not None]
+
+                transformed_points_list, transformed_probs_list = points_transform_and_normclip(
+                    points_prev_list=prev_points_list,
+                    pos_curr=torch.stack(t_pos_data_list),
+                    quat_curr=torch.stack(t_quat_data_list),
+                    pos_prev=torch.stack(_t_pos_data_list),
+                    quat_prev=torch.stack(_t_quat_data_list),
+                    feats_prev_list=prev_probs_list,
+                    scale=3.2,
+                    bound=0.5
+                )
+
+                _, hist_float_list, hist_voxel_list, temp_feats_list = voxelization(
+                    transformed_points_list, config.completion_resolution, transformed_probs_list
+                )
+                hist_feats_list = compute_feats(
+                    coords_float_list=hist_float_list,
+                    coords_voxel_list=hist_voxel_list,
+                    time_encoding=1.0,
+                    prob=temp_feats_list
+                )
+
+                for batch_idx in range(config.batch_size):
+                    all_input_coords[batch_idx] = torch.cat([all_input_coords[batch_idx], hist_voxel_list[batch_idx]], dim=0)
+                    all_input_feats[batch_idx] = torch.cat([all_input_feats[batch_idx], hist_feats_list[batch_idx]], dim=0)
+
             batched_input_coords, batched_input_feats = ME.utils.sparse_collate(
-                t_p_coords_voxel_list, curr_feats_list, device=device
+                all_input_coords, all_input_feats, device=device
             )
             batched_gt_coords = ME.utils.batched_coordinates(t_c_coords_voxel_list).to(device)
 
@@ -786,9 +920,14 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
                 out_cls, out_targets, sout, occ_probs = completion_net(sin_fused, in_target_key)
 
             sout_coords_list, _ = sout.decomposed_coordinates_and_features
-            sout_points_norm_list, _ = devoxelization(
+            sout_points_norm_list, sout_coords_floats_list = devoxelization(
                 sout_coords_list, res=config.completion_resolution
             )
+
+            # 更新历史帧缓存
+            num_points_list = [pts.shape[0] for pts in sout_points_norm_list]
+            occ_probs_list = torch.split(occ_probs.detach(), num_points_list)
+            prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
             # ---- 对每个 batch 项进行多次采样训练 ----
             batch_sampler_loss = 0.0
@@ -803,18 +942,15 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
                 if rec_points.shape[0] < 3 or gt_points.shape[0] < 3:
                     continue
 
-                cloud_center = rec_points[:, :2].mean(dim=0)
-
                 for s in range(config.samples_per_frame):
-                    # 模拟机器人水平位置扰动 (数据增强)
-                    jitter = (torch.rand(2, device=device) - 0.5) * config.position_jitter
-                    query_center = robot_norm_pos + jitter
-                    robot_rel = query_center - cloud_center
+                    # 自适应随机采样中心 + 360°随机 yaw 旋转 (数据增强)
+                    query_center = sample_random_center(grid_size, margin=0.05, device=device)
+                    yaw = torch.rand(1, device=device).item() * 2.0 * np.pi
 
                     # 网络预测
-                    pred_h, grid_xy, nx, ny = sampler_net(rec_points, query_center, robot_rel)
+                    pred_h, grid_xy, nx, ny = sampler_net(rec_points, query_center, yaw=yaw)
 
-                    # 真值采样
+                    # 真值采样 (使用同一套旋转后的 grid_xy)
                     gt_h, gt_valid = sample_heightmap_from_points(
                         gt_points, grid_xy, max_dist=config.max_nn_dist
                     )
