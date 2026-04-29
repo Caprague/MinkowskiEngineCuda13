@@ -157,10 +157,10 @@ logging.basicConfig(
 parser = argparse.ArgumentParser()
 # -- 补全网络配置 (用于加载预训练权重) --
 parser.add_argument("--completion_resolution",  type=int,       default=64)
-parser.add_argument("--completion_activeF",     type=float,     default=0.0)
+parser.add_argument("--completion_activeF",     type=float,     default=0.35)
 parser.add_argument("--freeze_completion",      type=bool,      default=True,   help="是否冻结补全网络参数")
 parser.add_argument("--completion_checkpoint",  type=str,       help="预训练 LidarCompletionNet 的 checkpoint 路径",
-                    default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/model_30000.pth')
+                    default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/export/model.pth')
 
 # -- 高度图网络配置 --
 parser.add_argument("--grid_res_phys",          type=float,     default=0.1,
@@ -175,16 +175,14 @@ parser.add_argument("--hidden_dim",             type=int,       default=256,
                     help="轻量网络隐藏层维度")
 parser.add_argument("--samples_per_frame",      type=int,       default=8,
                     help="每帧点云模拟的采样次数")
-parser.add_argument("--position_jitter",        type=float,     default=9.6,
-                    help="机器人水平位置随机扰动范围 (x64坐标)")
 parser.add_argument("--max_nn_dist",            type=float,     default=5.12,
                     help="真值近邻采样最大有效距离 (x64坐标)")
 parser.add_argument("--num_bins",               type=int,       default=32,
-                    help="高度离散化 bin 数量 (Scheme 3)")
+                    help="高度离散化 bin 数量")
 parser.add_argument("--w_grad",                 type=float,     default=0.5,
-                    help="梯度匹配损失权重 (Scheme 2)")
+                    help="梯度匹配损失权重")
 parser.add_argument("--w_cls",                  type=float,     default=1.0,
-                    help="分类损失权重 (Scheme 3)")
+                    help="分类损失权重")
 
 # -- 补全网络通道配置 (需与训练时的 checkpoint 匹配) --
 ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
@@ -1134,7 +1132,7 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
                 step_valid_ratios.append(batch_valid_count / total_samples if total_samples > 0 else 0.0)
 
                 train_steps += 1
-                writer.add_scalar("Loss/HeightmapL1", batch_sampler_loss.item(), train_steps)
+                writer.add_scalar("Loss/StepHeightmap", batch_sampler_loss.item(), train_steps)
 
         # ---- 梯度裁剪与参数更新 ----
         torch.nn.utils.clip_grad_norm_(sampler_net.parameters(), max_norm=config.max_norm)
@@ -1146,7 +1144,7 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
         avg_valid = sum(step_valid_ratios) / len(step_valid_ratios) if step_valid_ratios else 0.0
 
         writer.add_scalar("Time/IterTotal", total_time, iter_idx)
-        writer.add_scalar("Loss/IterHeightmapL1", avg_loss, iter_idx)
+        writer.add_scalar("Loss/IterHeightmap", avg_loss, iter_idx)
         writer.add_scalar("Metrics/ValidRatio", avg_valid, iter_idx)
         writer.add_scalar("Params/LR", scheduler.get_last_lr()[0], iter_idx)
 
