@@ -48,8 +48,8 @@
 
    - Point Encoder: 3 → hidden_dim → hidden_dim 逐点编码恢复出的点云
    - Local MLP: 对每个网格查询点，找 XY 平面 k-NN 邻居，拼接 rel_xyz(3) + feat(hidden_dim) → 距离倒数加权聚合
-   - Query MLP: local_feat + query_xy(2) + height_stats(4) → hidden_dim → hidden_dim/2 → 1 输出预测高度
-   - height_stats = [z_mean, z_min, z_max, z_std] 来自 k-NN 邻居，显式提供边缘锐利信息
+   - Query MLP: local_feat + query_xy(2) + height_stats(5) → hidden_dim → hidden_dim/2 → 1 输出预测高度
+   - height_stats = [z_mean, z_min, z_max, z_std, z_nearest] 来自 k-NN 邻居，显式提供边缘锐利信息
 
    2. 网格采样 (generate_grid_xy + sample_heightmap_from_points)
 
@@ -416,10 +416,10 @@ class HeightMapSampler(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), height_stats(4)] -> 1 (height)
-        # height_stats = [z_mean, z_min, z_max, z_std] 来自 k-NN 邻居
+        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), height_stats(5)] -> 1 (height)
+        # height_stats = [z_mean, z_min, z_max, z_std, z_nearest] 来自 k-NN 邻居
         self.query_mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 2 + 4, hidden_dim),
+            nn.Linear(hidden_dim + 2 + 5, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
@@ -448,49 +448,50 @@ class HeightMapSampler(nn.Module):
         M = grid_xy.shape[0]
 
         # 2. 编码输入点云
-        p_feats = self.point_encoder(points)  # (N, hidden_dim)
+        p_feats = self.point_encoder(points)            # (N, hidden_dim)
 
         # 3. XY 平面 k-NN 搜索
-        dists = torch.cdist(grid_xy, points[:, :2])  # (M, N) — 始终计算，后续加权聚合复用
+        dists = torch.cdist(grid_xy, points[:, :2])     # (M, N) — 始终计算，后续加权聚合复用
         k_actual = min(self.k, points.shape[0])
         if points.shape[0] <= k_actual:
             # 点过少时全部复制
             nn_idx = torch.arange(points.shape[0], device=points.device).unsqueeze(0).expand(M, -1)
             k_actual = points.shape[0]
         else:
-            _, nn_idx = torch.topk(dists, k_actual, largest=False, dim=1)  # (M, k_actual)
+            _, nn_idx = torch.topk(dists, k_actual, largest=False, dim=1)   # (M, k_actual)
 
         # 4. 聚合局部邻居特征
-        neighbor_pts = points[nn_idx]       # (M, k_actual, 3)
-        neighbor_feats = p_feats[nn_idx]    # (M, k_actual, hidden_dim)
+        neighbor_pts = points[nn_idx]           # (M, k_actual, 3)
+        neighbor_feats = p_feats[nn_idx]        # (M, k_actual, hidden_dim)
 
         # 查询点扩展为 (M, k_actual, 3) 用于计算相对位置
         queries_xyz = torch.cat([
             grid_xy,
             torch.zeros(M, 1, device=points.device, dtype=torch.float32)
         ], dim=1)
-        rel_pos = neighbor_pts - queries_xyz.unsqueeze(1)  # (M, k_actual, 3)
+        rel_pos = neighbor_pts - queries_xyz.unsqueeze(1)                   # (M, k_actual, 3)
 
-        local_input = torch.cat([rel_pos, neighbor_feats], dim=-1)  # (M, k_actual, 3+hidden)
-        local_output = self.local_mlp(local_input)                   # (M, k_actual, hidden)
+        local_input = torch.cat([rel_pos, neighbor_feats], dim=-1)          # (M, k_actual, 3+hidden)
+        local_output = self.local_mlp(local_input)                          # (M, k_actual, hidden)
 
-        # 距离倒数加权聚合 (替代 MaxPool，保留距离近的邻居贡献更大，有利于阶梯锐利边缘)
-        nn_dists = torch.gather(dists, 1, nn_idx)                    # (M, k_actual)
-        inv_weights = 1.0 / (nn_dists + 1e-6)                       # (M, k_actual)
-        inv_weights = inv_weights / inv_weights.sum(dim=1, keepdim=True)  # 归一化
+        # 距离倒数平方加权聚合 (替代 MaxPool，1/dist^2 衰减更陡，阶梯边缘更锐利)
+        nn_dists = torch.gather(dists, 1, nn_idx)                           # (M, k_actual)
+        inv_weights = 1.0 / (nn_dists.pow(2) + 1e-8)                        # (M, k_actual)
+        inv_weights = inv_weights / inv_weights.sum(dim=1, keepdim=True)    # 归一化
         local_feat = (local_output * inv_weights.unsqueeze(-1)).sum(dim=1)  # (M, hidden)
 
-        # 邻居高度统计特征 (z_mean, z_min, z_max, z_std) — 显式提供边缘信息
-        neighbor_z = neighbor_pts[:, :, 2]                           # (M, k_actual)
+        # 邻居高度统计特征 — 显式提供边缘信息
+        neighbor_z = neighbor_pts[:, :, 2]                                  # (M, k_actual)
         z_mean = neighbor_z.mean(dim=1)
         z_min = neighbor_z.min(dim=1)[0]
         z_max = neighbor_z.max(dim=1)[0]
         z_std = neighbor_z.std(dim=1).clamp(max=2.0)
-        height_stats = torch.stack([z_mean, z_min, z_max, z_std], dim=-1)  # (M, 4)
+        z_nearest = neighbor_z[:, 0]                                                    # 最近邻高度 (k-NN 已按距离排序)
+        height_stats = torch.stack([z_mean, z_min, z_max, z_std, z_nearest], dim=-1)    # (M, 5)
 
         # 5. 全局查询解码
-        query_input = torch.cat([local_feat, grid_xy, height_stats], dim=-1)  # (M, hidden+2+4)
-        pred_heights = self.query_mlp(query_input).squeeze(-1)       # (M,)
+        query_input = torch.cat([local_feat, grid_xy, height_stats], dim=-1)    # (M, hidden+2+5)
+        pred_heights = self.query_mlp(query_input).squeeze(-1)                  # (M,)
 
         return pred_heights, grid_xy, nx, ny
 
@@ -778,11 +779,6 @@ class HeightmapVisualizer:
 
         self.gt_samples_pcd.points = o3d.utility.Vector3dVector(gt_pcd_pts)
         self.gt_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.05, 0.05], (len(gt_pcd_pts), 1)))
-        # 放大采样点体积: 3D 均匀膨胀使采样点更显眼
-        gt_pcd_inflated = gt_pcd_pts.copy()
-        gt_center = gt_pcd_inflated.mean(axis=0)
-        gt_pcd_inflated = gt_center + (gt_pcd_inflated - gt_center) * 1.3
-        self.gt_samples_pcd.points = o3d.utility.Vector3dVector(gt_pcd_inflated)
         self.gt_samples_pcd.estimate_normals()
 
         # 真值网格线 (暗红色)
@@ -800,10 +796,6 @@ class HeightmapVisualizer:
 
         self.pred_samples_pcd.points = o3d.utility.Vector3dVector(pred_pcd_pts)
         self.pred_samples_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.05, 0.9, 1.0], (len(pred_pcd_pts), 1)))
-        # 放大采样点体积
-        pred_center = pred_pcd_pts.mean(axis=0)
-        pred_pcd_inflated = pred_center + (pred_pcd_pts - pred_center) * 1.3
-        self.pred_samples_pcd.points = o3d.utility.Vector3dVector(pred_pcd_inflated)
         self.pred_samples_pcd.estimate_normals()
 
         # 预测网格线 (暗青色)
@@ -818,22 +810,32 @@ class HeightmapVisualizer:
         self.pred_hm_pcd.colors = o3d.utility.Vector3dVector(color_by_height(pred_pcd_pts, z_min, z_max))
         self.pred_hm_pcd.estimate_normals()
 
-        # ---- 平移布局 (relative=False 避免累积漂移) ----
-        # 左上: 真值地形 + 采样叠加 + 网格线
-        self.gt_terrain_pcd.translate([-0.6, 0.6, 0.0], relative=False)
-        self.gt_samples_pcd.translate([-0.6, 0.6, 0.0], relative=False)
-        self.gt_grid_lines.translate([-0.6, 0.6, 0.0], relative=False)
+        # ---- 平移布局 (relative=True，从原始坐标偏移到目标位置) ----
+        # 关键: 同一视图的地形、采样点、网格线使用相同偏移量，保持相对位置正确
 
-        # 右上: 恢复地形 + 采样叠加 + 网格线
-        self.rec_terrain_pcd.translate([0.6, 0.6, 0.0], relative=False)
-        self.pred_samples_pcd.translate([0.6, 0.6, 0.0], relative=False)
-        self.pred_grid_lines.translate([0.6, 0.6, 0.0], relative=False)
+        # 左上: 真值地形 + 采样 + 网格线 — 以 GT 地形质心为基准移到 [-0.6, 0.6, 0]
+        gt_c = np.asarray(self.gt_terrain_pcd.points).mean(axis=0)
+        gt_offset = np.array([-0.6, 0.6, 0.0]) - gt_c
+        self.gt_terrain_pcd.translate(gt_offset, relative=True)
+        self.gt_samples_pcd.translate(gt_offset, relative=True)
+        self.gt_grid_lines.translate(gt_offset, relative=True)
 
-        # 左下: 输入
-        self.in_pcd.translate([-0.6, -0.6, 0.0], relative=False)
+        # 右上: 恢复地形 + 采样 + 网格线 — 以恢复地形质心为基准移到 [0.6, 0.6, 0]
+        rec_c = np.asarray(self.rec_terrain_pcd.points).mean(axis=0)
+        rec_offset = np.array([0.6, 0.6, 0.0]) - rec_c
+        self.rec_terrain_pcd.translate(rec_offset, relative=True)
+        self.pred_samples_pcd.translate(rec_offset, relative=True)
+        self.pred_grid_lines.translate(rec_offset, relative=True)
 
-        # 右下: 预测高度图参考
-        self.pred_hm_pcd.translate([0.6, -0.6, 0.0], relative=False)
+        # 左下: 输入 — 以输入质心为基准移到 [-0.6, -0.6, 0]
+        in_c = np.asarray(self.in_pcd.points).mean(axis=0)
+        in_offset = np.array([-0.6, -0.6, 0.0]) - in_c
+        self.in_pcd.translate(in_offset, relative=True)
+
+        # 右下: 预测高度图参考 — 以预测采样质心为基准移到 [0.6, -0.6, 0]
+        hm_c = np.asarray(self.pred_hm_pcd.points).mean(axis=0)
+        hm_offset = np.array([0.6, -0.6, 0.0]) - hm_c
+        self.pred_hm_pcd.translate(hm_offset, relative=True)
 
         for geo in (self.in_pcd, self.gt_terrain_pcd, self.gt_samples_pcd,
                     self.rec_terrain_pcd, self.pred_samples_pcd, self.pred_hm_pcd,
