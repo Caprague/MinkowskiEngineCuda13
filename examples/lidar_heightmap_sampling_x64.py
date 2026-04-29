@@ -521,9 +521,9 @@ class HeightMapSampler(nn.Module):
         local_input = torch.cat([rel_pos, neighbor_feats], dim=-1)          # (M, k_actual, 3+hidden)
         local_output = self.local_mlp(local_input)                          # (M, k_actual, hidden)
 
-        # 距离倒数平方加权聚合 (替代 MaxPool，1/dist^2 衰减更陡，阶梯边缘更锐利)
+        # 距离倒数指数加权聚合
         nn_dists = torch.gather(dists, 1, nn_idx)                           # (M, k_actual)
-        inv_weights = 1.0 / (nn_dists.pow(2) + 1e-8)                        # (M, k_actual)
+        inv_weights = 1.0 / (nn_dists.pow(3) + 1e-8)                        # (M, k_actual)
         inv_weights = inv_weights / inv_weights.sum(dim=1, keepdim=True)    # 归一化
         local_feat = (local_output * inv_weights.unsqueeze(-1)).sum(dim=1)  # (M, hidden)
 
@@ -984,6 +984,8 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
         writer.add_scalar("Time/DataLoading", data_time, iter_idx)
 
         step_losses = []
+        step_grad_losses = []
+        step_cls_losses = []
         step_valid_ratios = []
 
         optimizer.zero_grad()
@@ -1082,6 +1084,8 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
 
             # ---- 对每个 batch 项进行多次采样训练 ----
             batch_sampler_loss = 0.0
+            batch_grad_loss = 0.0
+            batch_cls_loss = 0.0
             batch_valid_count = 0
             total_samples = 0
             valid_samples = 0
@@ -1121,6 +1125,8 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
 
                         loss = loss_l1 + config.w_grad * loss_grad + config.w_cls * loss_cls
                         batch_sampler_loss += loss
+                        batch_grad_loss += loss_grad.item()
+                        batch_cls_loss += loss_cls.item()
                         batch_valid_count += gt_valid.sum().item()
                         valid_samples += 1
 
@@ -1129,10 +1135,14 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
                 batch_sampler_loss.backward()
 
                 step_losses.append(batch_sampler_loss.item())
+                step_grad_losses.append(batch_grad_loss / valid_samples)
+                step_cls_losses.append(batch_cls_loss / valid_samples)
                 step_valid_ratios.append(batch_valid_count / total_samples if total_samples > 0 else 0.0)
 
                 train_steps += 1
                 writer.add_scalar("Loss/StepHeightmap", batch_sampler_loss.item(), train_steps)
+                writer.add_scalar("Loss/StepGrad", batch_grad_loss / valid_samples, train_steps)
+                writer.add_scalar("Loss/StepCls", batch_cls_loss / valid_samples, train_steps)
 
         # ---- 梯度裁剪与参数更新 ----
         torch.nn.utils.clip_grad_norm_(sampler_net.parameters(), max_norm=config.max_norm)
@@ -1141,10 +1151,14 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
 
         total_time = time() - start_time
         avg_loss = sum(step_losses) / len(step_losses) if step_losses else 0.0
+        avg_grad = sum(step_grad_losses) / len(step_grad_losses) if step_grad_losses else 0.0
+        avg_cls = sum(step_cls_losses) / len(step_cls_losses) if step_cls_losses else 0.0
         avg_valid = sum(step_valid_ratios) / len(step_valid_ratios) if step_valid_ratios else 0.0
 
         writer.add_scalar("Time/IterTotal", total_time, iter_idx)
         writer.add_scalar("Loss/IterHeightmap", avg_loss, iter_idx)
+        writer.add_scalar("Loss/IterGrad", avg_grad, iter_idx)
+        writer.add_scalar("Loss/IterCls", avg_cls, iter_idx)
         writer.add_scalar("Metrics/ValidRatio", avg_valid, iter_idx)
         writer.add_scalar("Params/LR", scheduler.get_last_lr()[0], iter_idx)
 
