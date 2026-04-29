@@ -185,7 +185,7 @@ ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
 DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
 # -- 训练配置 --
-parser.add_argument("--max_iter",              type=int,                default=5001)
+parser.add_argument("--max_iter",              type=int,                default=2001)
 parser.add_argument("--stat_freq_iter",        type=int,                default=50)
 parser.add_argument("--save_freq_iter",        type=int,                default=100)
 parser.add_argument("--batch_size",            type=int,                default=4)
