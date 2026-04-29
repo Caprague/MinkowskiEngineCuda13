@@ -175,10 +175,16 @@ parser.add_argument("--hidden_dim",             type=int,       default=256,
                     help="轻量网络隐藏层维度")
 parser.add_argument("--samples_per_frame",      type=int,       default=8,
                     help="每帧点云模拟的采样次数")
-parser.add_argument("--position_jitter",        type=float,     default=0.15,
-                    help="机器人水平位置随机扰动范围 (归一化坐标)")
-parser.add_argument("--max_nn_dist",            type=float,     default=0.08,
-                    help="真值近邻采样最大有效距离 (归一化坐标)")
+parser.add_argument("--position_jitter",        type=float,     default=9.6,
+                    help="机器人水平位置随机扰动范围 (x64坐标)")
+parser.add_argument("--max_nn_dist",            type=float,     default=5.12,
+                    help="真值近邻采样最大有效距离 (x64坐标)")
+parser.add_argument("--num_bins",               type=int,       default=32,
+                    help="高度离散化 bin 数量 (Scheme 3)")
+parser.add_argument("--w_grad",                 type=float,     default=0.5,
+                    help="梯度匹配损失权重 (Scheme 2)")
+parser.add_argument("--w_cls",                  type=float,     default=1.0,
+                    help="分类损失权重 (Scheme 3)")
 
 # -- 补全网络通道配置 (需与训练时的 checkpoint 匹配) --
 ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
@@ -269,31 +275,32 @@ def generate_grid_xy(center_xy, grid_size, grid_res, device, yaw=0.0):
     return grid_xy, nx, ny
 
 
-def sample_random_center(grid_size, margin=0.05, device="cuda"):
+def sample_random_center(grid_size, margin=0.05, device="cuda", coord_max=64.0):
     """
-    根据网格尺寸自适应生成随机采样中心，保证网格大部分落在 [0,1] 范围内。
+    根据网格尺寸自适应生成随机采样中心，保证网格大部分落在 [0, coord_max] 范围内。
 
     Args:
-        grid_size: [size_x, size_y] 网格总尺寸 (归一化)
+        grid_size: [size_x, size_y] 网格总尺寸
         margin:    边界余量
         device:    torch device
+        coord_max: 坐标空间上界 (x64坐标下为 64.0)
 
     Returns:
         center_xy: (2,) 随机中心坐标
     """
     size_x, size_y = grid_size
     min_x = size_x / 2.0 + margin
-    max_x = 1.0 - size_x / 2.0 - margin
+    max_x = coord_max - size_x / 2.0 - margin
     min_y = size_y / 2.0 + margin
-    max_y = 1.0 - size_y / 2.0 - margin
+    max_y = coord_max - size_y / 2.0 - margin
 
     if max_x <= min_x:
-        cx = torch.tensor([0.5], device=device, dtype=torch.float32)
+        cx = torch.tensor([coord_max / 2.0], device=device, dtype=torch.float32)
     else:
         cx = torch.rand(1, device=device, dtype=torch.float32) * (max_x - min_x) + min_x
 
     if max_y <= min_y:
-        cy = torch.tensor([0.5], device=device, dtype=torch.float32)
+        cy = torch.tensor([coord_max / 2.0], device=device, dtype=torch.float32)
     else:
         cy = torch.rand(1, device=device, dtype=torch.float32) * (max_y - min_y) + min_y
 
@@ -371,6 +378,44 @@ def build_grid_lines(grid_xy, heights, nx, ny):
     return flat_points, np.array(lines, dtype=np.int32) if lines else np.zeros((0, 2), dtype=np.int32)
 
 
+def compute_gradient_loss(pred, gt, nx, ny, valid_mask):
+    """
+    计算预测高度图与真值高度图在 x/y 方向上的梯度 L1 损失 (Scheme 2)。
+
+    Args:
+        pred:       (M,) 预测高度
+        gt:         (M,) 真值高度
+        nx, ny:     网格尺寸
+        valid_mask: (M,) bool，有效格点标记
+
+    Returns:
+        loss_grad:  标量 tensor
+    """
+    pred_map = pred.reshape(nx, ny)
+    gt_map = gt.reshape(nx, ny)
+    valid_map = valid_mask.reshape(nx, ny)
+
+    # x 方向梯度 (沿第 0 轴，相邻行)
+    pred_grad_x = pred_map[1:, :] - pred_map[:-1, :]
+    gt_grad_x = gt_map[1:, :] - gt_map[:-1, :]
+    valid_grad_x = valid_map[1:, :] & valid_map[:-1, :]
+    if valid_grad_x.any():
+        loss_grad_x = (pred_grad_x[valid_grad_x] - gt_grad_x[valid_grad_x]).abs().mean()
+    else:
+        loss_grad_x = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+    # y 方向梯度 (沿第 1 轴，相邻列)
+    pred_grad_y = pred_map[:, 1:] - pred_map[:, :-1]
+    gt_grad_y = gt_map[:, 1:] - gt_map[:, :-1]
+    valid_grad_y = valid_map[:, 1:] & valid_map[:, :-1]
+    if valid_grad_y.any():
+        loss_grad_y = (pred_grad_y[valid_grad_y] - gt_grad_y[valid_grad_y]).abs().mean()
+    else:
+        loss_grad_y = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+    return loss_grad_x + loss_grad_y
+
+
 ###############################################################################
 # End of grid sampling utilities
 ###############################################################################
@@ -394,12 +439,14 @@ class HeightMapSampler(nn.Module):
         hidden_dim: int = 64,
         grid_res: float = 0.03125,
         grid_size: tuple = (0.5, 0.3125),
+        num_bins: int = 32,
     ):
         super().__init__()
         self.k = k
         self.hidden_dim = hidden_dim
         self.grid_res = grid_res
         self.grid_size = grid_size
+        self.num_bins = num_bins
 
         # 逐点编码器: 3 -> hidden_dim
         self.point_encoder = nn.Sequential(
@@ -416,14 +463,14 @@ class HeightMapSampler(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), height_stats(5)] -> 1 (height)
+        # 查询解码器: [pooled_local(hidden_dim), query_xy(2), height_stats(5)] -> num_bins + 1 (logits + residual)
         # height_stats = [z_mean, z_min, z_max, z_std, z_nearest] 来自 k-NN 邻居
         self.query_mlp = nn.Sequential(
             nn.Linear(hidden_dim + 2 + 5, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim // 2, num_bins + 1),
         )
 
     def generate_grid(self, center_xy, device, yaw=0.0):
@@ -433,8 +480,8 @@ class HeightMapSampler(nn.Module):
     def forward(self, points, center_xy, yaw=0.0):
         """
         Args:
-            points:        (N, 3) 恢复后的点云 (归一化坐标)
-            center_xy:     (2,)   采样网格中心 (通常是机器人水平位置)
+            points:        (N, 3) 恢复后的点云 (x64 坐标)
+            center_xy:     (2,)   采样网格中心 (x64 坐标)
             yaw:           绕 z 轴旋转角度 (弧度)，默认 0.0
 
         Returns:
@@ -442,6 +489,8 @@ class HeightMapSampler(nn.Module):
             grid_xy:       (M, 2) 网格 XY 坐标
             nx:            x 方向网格数
             ny:            y 方向网格数
+            bin_logits:    (M, num_bins) 分类 logits
+            bin_centers:   (M, num_bins) 各查询点的 bin 中心
         """
         # 1. 生成查询网格
         grid_xy, nx, ny = self.generate_grid(center_xy, points.device, yaw=yaw)
@@ -489,11 +538,23 @@ class HeightMapSampler(nn.Module):
         z_nearest = neighbor_z[:, 0]                                                    # 最近邻高度 (k-NN 已按距离排序)
         height_stats = torch.stack([z_mean, z_min, z_max, z_std, z_nearest], dim=-1)    # (M, 5)
 
-        # 5. 全局查询解码
+        # 5. 全局查询解码 (Scheme 3: bin + residual)
         query_input = torch.cat([local_feat, grid_xy, height_stats], dim=-1)    # (M, hidden+2+5)
-        pred_heights = self.query_mlp(query_input).squeeze(-1)                  # (M,)
+        query_out = self.query_mlp(query_input)                                 # (M, num_bins+1)
+        bin_logits = query_out[:, :self.num_bins]                               # (M, num_bins)
+        residual = query_out[:, self.num_bins]                                  # (M,)
 
-        return pred_heights, grid_xy, nx, ny
+        # 基于局部 k-NN 的 z 范围构建 per-query bin centers
+        z_min_local = neighbor_z.min(dim=1)[0]                                  # (M,)
+        z_max_local = neighbor_z.max(dim=1)[0]                                  # (M,)
+        z_range_local = (z_max_local - z_min_local).clamp(min=1e-6).unsqueeze(1)  # (M, 1)
+        bin_offsets = (torch.arange(self.num_bins, device=points.device, dtype=torch.float32).unsqueeze(0) + 0.5) / self.num_bins  # (1, num_bins)
+        bin_centers = z_min_local.unsqueeze(1) + bin_offsets * z_range_local     # (M, num_bins)
+
+        pred_bin_idx = bin_logits.argmax(dim=1)                                 # (M,)
+        pred_heights = bin_centers[torch.arange(M, device=points.device), pred_bin_idx] + residual  # (M,)
+
+        return pred_heights, grid_xy, nx, ny, bin_logits, bin_centers
 
 
 ###############################################################################
@@ -539,10 +600,10 @@ class HeightmapVisualizer:
         # 历史帧缓存 (对齐 lidar_sparse_completion_x64 的 Visualizer 逻辑)
         self.prev_frame_data = [None] * 1  # batch_size=1 for visualization
 
-        # 归一化网格参数 (用于 sample_random_center)
-        self.grid_res = config.grid_res_phys / config.phys_scale
-        self.grid_size = (config.grid_size_phys[0] / config.phys_scale,
-                          config.grid_size_phys[1] / config.phys_scale)
+        # x64 网格参数 (用于 sample_random_center)
+        self.grid_res = config.grid_res_phys / config.phys_scale * 64.0
+        self.grid_size = (config.grid_size_phys[0] / config.phys_scale * 64.0,
+                          config.grid_size_phys[1] / config.phys_scale * 64.0)
 
         print("\n高度图可视化布局:")
         print(" 左上: 真值地形(黄) + 采样点(红) + 网格线(暗红)")
@@ -731,23 +792,25 @@ class HeightmapVisualizer:
         self.prev_frame_data = [(coords, probs.unsqueeze(1)) for coords, probs in zip(sout_points_norm_list, occ_probs_list)]
 
         # ---- 生成高度图并可视化 (仅展示第一项) ----
-        rec_points = sout_points_norm_list[0]          # (N, 3)
-        gt_points = t_c_points_list[0]                 # (M, 3)
+        rec_points_raw = sout_points_norm_list[0]          # (N, 3) 归一化
+        gt_points_raw = t_c_points_list[0]                 # (M, 3) 归一化
+        rec_points = sout_coords_floats_list[0]            # (N, 3) x64
+        gt_points = gt_points_raw * 64.0
 
         # 每帧随机采样中心与朝向 (与训练一致)
-        vis_center = sample_random_center(self.grid_size, margin=0.05, device=self.device)
+        vis_center = sample_random_center(self.grid_size, margin=3.2, device=self.device, coord_max=64.0)
         vis_yaw = torch.rand(1, device=self.device).item() * 2.0 * np.pi
 
         with torch.no_grad():
-            pred_h, grid_xy, nx, ny = self.sampler_net(rec_points, vis_center, yaw=vis_yaw)
+            pred_h, grid_xy, nx, ny, *_ = self.sampler_net(rec_points, vis_center, yaw=vis_yaw)
 
         gt_h, gt_valid = sample_heightmap_from_points(
             gt_points, grid_xy, max_dist=self.config.max_nn_dist
         )
 
-        # 构建采样点坐标 (x, y, z)
-        pred_pcd_pts = torch.cat([grid_xy, pred_h.unsqueeze(-1)], dim=1).cpu().numpy()
-        gt_pcd_pts = torch.cat([grid_xy, gt_h.unsqueeze(-1)], dim=1).cpu().numpy()
+        # 构建采样点坐标 (x, y, z) — 转回归一化用于显示
+        pred_pcd_pts = (torch.cat([grid_xy, pred_h.unsqueeze(-1)], dim=1) / 64.0).cpu().numpy()
+        gt_pcd_pts = (torch.cat([grid_xy, gt_h.unsqueeze(-1)], dim=1) / 64.0).cpu().numpy()
 
         # 统一高度范围着色 (仅用于右下角的独立预测高度图)
         def color_by_height(pts, z_min=None, z_max=None):
@@ -772,7 +835,7 @@ class HeightmapVisualizer:
         self.in_pcd.estimate_normals()
 
         # ---- 左上: 真值稠密地形 (暗黄色底色) + 真值采样点 (亮红色叠加) ----
-        gt_pc = gt_points.cpu().numpy()
+        gt_pc = gt_points_raw.cpu().numpy()
         self.gt_terrain_pcd.points = o3d.utility.Vector3dVector(gt_pc)
         self.gt_terrain_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.7, 0.7, 0.3], (len(gt_pc), 1)))
         self.gt_terrain_pcd.estimate_normals()
@@ -783,13 +846,13 @@ class HeightmapVisualizer:
 
         # 真值网格线 (暗红色)
         gt_line_pts, gt_line_idx = build_grid_lines(grid_xy, gt_h, nx, ny)
-        self.gt_grid_lines.points = o3d.utility.Vector3dVector(gt_line_pts)
+        self.gt_grid_lines.points = o3d.utility.Vector3dVector(gt_line_pts / 64.0)
         self.gt_grid_lines.lines = o3d.utility.Vector2iVector(gt_line_idx)
         gt_line_colors = np.tile([0.7, 0.15, 0.15], (len(gt_line_idx), 1))
         self.gt_grid_lines.colors = o3d.utility.Vector3dVector(gt_line_colors)
 
         # ---- 右上: 恢复地形 (暗绿色底色) + 预测采样点 (亮青色叠加) ----
-        rec_pc = rec_points.cpu().numpy()
+        rec_pc = rec_points_raw.cpu().numpy()
         self.rec_terrain_pcd.points = o3d.utility.Vector3dVector(rec_pc)
         self.rec_terrain_pcd.colors = o3d.utility.Vector3dVector(np.tile([0.3, 0.7, 0.3], (len(rec_pc), 1)))
         self.rec_terrain_pcd.estimate_normals()
@@ -800,7 +863,7 @@ class HeightmapVisualizer:
 
         # 预测网格线 (暗青色)
         pred_line_pts, pred_line_idx = build_grid_lines(grid_xy, pred_h, nx, ny)
-        self.pred_grid_lines.points = o3d.utility.Vector3dVector(pred_line_pts)
+        self.pred_grid_lines.points = o3d.utility.Vector3dVector(pred_line_pts / 64.0)
         self.pred_grid_lines.lines = o3d.utility.Vector2iVector(pred_line_idx)
         pred_line_colors = np.tile([0.1, 0.5, 0.55], (len(pred_line_idx), 1))
         self.pred_grid_lines.colors = o3d.utility.Vector3dVector(pred_line_colors)
@@ -905,10 +968,10 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
     train_steps = start_step
     data_time = 0
 
-    # 归一化网格参数
-    grid_res = config.grid_res_phys / config.phys_scale
-    grid_size = [config.grid_size_phys[0] / config.phys_scale,
-                 config.grid_size_phys[1] / config.phys_scale]
+    # x64 网格参数
+    grid_res = config.grid_res_phys / config.phys_scale * 64.0
+    grid_size = [config.grid_size_phys[0] / config.phys_scale * 64.0,
+                 config.grid_size_phys[1] / config.phys_scale * 64.0]
 
     # 历史帧缓存 (跨帧但跨 sample 时 t=0 不启用，同 lidar_sparse_completion_x64)
     prev_frame_data = [None] * config.batch_size
@@ -1026,19 +1089,19 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
             valid_samples = 0
 
             for b in range(config.batch_size):
-                rec_points = sout_points_norm_list[b]      # 恢复点云 (N, 3)
-                gt_points = t_c_points_list[b]             # 真值稠密点云 (M, 3)
+                rec_points = sout_coords_floats_list[b]           # 恢复点云 (N, 3) x64
+                gt_points = t_c_points_list[b] * 64.0             # 真值稠密点云 (M, 3) x64
 
                 if rec_points.shape[0] < 3 or gt_points.shape[0] < 3:
                     continue
 
                 for s in range(config.samples_per_frame):
                     # 自适应随机采样中心 + 360°随机 yaw 旋转 (数据增强)
-                    query_center = sample_random_center(grid_size, margin=0.05, device=device)
+                    query_center = sample_random_center(grid_size, margin=3.2, device=device, coord_max=64.0)
                     yaw = torch.rand(1, device=device).item() * 2.0 * np.pi
 
-                    # 网络预测
-                    pred_h, grid_xy, nx, ny = sampler_net(rec_points, query_center, yaw=yaw)
+                    # 网络预测 (Scheme 3: bin + residual)
+                    pred_h, grid_xy, nx, ny, bin_logits, bin_centers = sampler_net(rec_points, query_center, yaw=yaw)
 
                     # 真值采样 (使用同一套旋转后的 grid_xy)
                     gt_h, gt_valid = sample_heightmap_from_points(
@@ -1047,7 +1110,18 @@ def train(completion_net, sampler_net, dataloader, optimizer, scheduler, start_i
 
                     total_samples += len(gt_valid)
                     if gt_valid.any():
-                        loss = crit_l1(pred_h[gt_valid], gt_h[gt_valid])
+                        loss_l1 = crit_l1(pred_h[gt_valid], gt_h[gt_valid])
+
+                        # Scheme 2: 梯度匹配损失
+                        loss_grad = compute_gradient_loss(pred_h, gt_h, nx, ny, gt_valid)
+
+                        # Scheme 3: bin 分类辅助损失
+                        with torch.no_grad():
+                            dist_to_bins = (gt_h.unsqueeze(1) - bin_centers).abs()  # (M, num_bins)
+                            bin_target = dist_to_bins.argmin(dim=1)  # (M,)
+                        loss_cls = nn.functional.cross_entropy(bin_logits[gt_valid], bin_target[gt_valid])
+
+                        loss = loss_l1 + config.w_grad * loss_grad + config.w_cls * loss_cls
                         batch_sampler_loss += loss
                         batch_valid_count += gt_valid.sum().item()
                         valid_samples += 1
@@ -1143,15 +1217,16 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # 2. 初始化高度图采样网络
     # -------------------------------------------------------------------------
-    grid_res = config.grid_res_phys / config.phys_scale
-    grid_size = (config.grid_size_phys[0] / config.phys_scale,
-                 config.grid_size_phys[1] / config.phys_scale)
+    grid_res = config.grid_res_phys / config.phys_scale * 64.0
+    grid_size = (config.grid_size_phys[0] / config.phys_scale * 64.0,
+                 config.grid_size_phys[1] / config.phys_scale * 64.0)
 
     sampler_net = HeightMapSampler(
         k=config.k_neighbors,
         hidden_dim=config.hidden_dim,
         grid_res=grid_res,
         grid_size=grid_size,
+        num_bins=config.num_bins,
     ).to(device)
 
     sampler_params = sum(p.numel() for p in sampler_net.parameters())
