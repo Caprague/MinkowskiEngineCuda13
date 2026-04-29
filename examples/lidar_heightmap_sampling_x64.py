@@ -155,50 +155,49 @@ logging.basicConfig(
 
 parser = argparse.ArgumentParser()
 # -- 补全网络配置 (用于加载预训练权重) --
-parser.add_argument("--completion_resolution", type=int, default=64)
-parser.add_argument("--completion_checkpoint", type=str, 
-                    default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/export/model.pth',
-                    help="预训练 LidarCompletionNet 的 checkpoint 路径")
-parser.add_argument("--completion_activeF",    type=float, default=0.35)
-parser.add_argument("--freeze_completion",     type=bool,  default=True,
-                    help="是否冻结补全网络参数")
+parser.add_argument("--completion_resolution",  type=int,       default=64)
+parser.add_argument("--completion_activeF",     type=float,     default=0.0)
+parser.add_argument("--freeze_completion",      type=bool,      default=True,   help="是否冻结补全网络参数")
+parser.add_argument("--completion_checkpoint",  type=str,       help="预训练 LidarCompletionNet 的 checkpoint 路径",
+                    default='/workspace/MinkowskiEngine/output/checkpoint/lidar_completion_x64_v1/model_30000.pth')
 
 # -- 高度图网络配置 --
-parser.add_argument("--grid_res_phys",         type=float, default=0.1,
+parser.add_argument("--grid_res_phys",          type=float,     default=0.1,
                     help="网格物理分辨率 (米)")
-parser.add_argument("--grid_size_phys",        type=float, nargs=2, default=[1.6, 1.0],
+parser.add_argument("--grid_size_phys",         type=float,     default=[1.6, 1.0],     nargs=2,
                     help="网格物理尺寸 [长, 宽] (米)")
-parser.add_argument("--phys_scale",            type=float, default=3.2,
+parser.add_argument("--phys_scale",             type=float,     default=3.2,
                     help="归一化坐标与物理尺度的换算系数: 1.0 (norm) = phys_scale (m)")
-parser.add_argument("--k_neighbors",           type=int,   default=16,
+parser.add_argument("--k_neighbors",            type=int,       default=16,
                     help="每个查询点最近邻数量")
-parser.add_argument("--hidden_dim",            type=int,   default=64,
+parser.add_argument("--hidden_dim",             type=int,       default=256,
                     help="轻量网络隐藏层维度")
-parser.add_argument("--samples_per_frame",     type=int,   default=8,
+parser.add_argument("--samples_per_frame",      type=int,       default=8,
                     help="每帧点云模拟的采样次数")
-parser.add_argument("--max_nn_dist",           type=float, default=0.08,
+parser.add_argument("--position_jitter",        type=float,     default=0.15,
+                    help="机器人水平位置随机扰动范围 (归一化坐标)")
+parser.add_argument("--max_nn_dist",            type=float,     default=0.08,
                     help="真值近邻采样最大有效距离 (归一化坐标)")
 
 # -- 补全网络通道配置 (需与训练时的 checkpoint 匹配) --
 ENC_CHANNELS = [16, 32, 64, 128, 256, 512]
 DEC_CHANNELS = [16, 32, 64, 128, 256, 512]
 
-
 # -- 训练配置 --
-parser.add_argument("--max_iter",              type=int,   default=5001)
-parser.add_argument("--stat_freq_iter",        type=int,   default=50)
-parser.add_argument("--save_freq_iter",        type=int,   default=100)
-parser.add_argument("--batch_size",            type=int,   default=4)
-parser.add_argument("--lr",                    type=float, default=1e-3)
-parser.add_argument("--weight_decay",          type=float, default=1e-4)
-parser.add_argument("--max_norm",              type=float, default=1.0)
-parser.add_argument("--num_workers",           type=int,   default=4)
-parser.add_argument("--log_dir",               type=str,   default="./output/logs_heightmap_x64")
-parser.add_argument("--save_dir",              type=str,   default="./output/checkpoint")
-parser.add_argument("--model_name",            type=str,   default="heightmap_sampler_v1")
+parser.add_argument("--max_iter",              type=int,                default=5001)
+parser.add_argument("--stat_freq_iter",        type=int,                default=50)
+parser.add_argument("--save_freq_iter",        type=int,                default=100)
+parser.add_argument("--batch_size",            type=int,                default=4)
+parser.add_argument("--lr",                    type=float,              default=1e-3)
+parser.add_argument("--weight_decay",          type=float,              default=1e-4)
+parser.add_argument("--max_norm",              type=float,              default=1.0)
+parser.add_argument("--num_workers",           type=int,                default=4)
+parser.add_argument("--log_dir",               type=str,                default="./output/logs_heightmap_x64")
+parser.add_argument("--save_dir",              type=str,                default="./output/checkpoint")
+parser.add_argument("--model_name",            type=str,                default="heightmap_sampler_v1")
+parser.add_argument("--max_visualization",     type=int,                default=20)
 parser.add_argument("--resume",                action="store_true")
 parser.add_argument("--eval",                  action="store_true")
-parser.add_argument("--max_visualization",     type=int,   default=20)
 
 
 ###############################################################################
