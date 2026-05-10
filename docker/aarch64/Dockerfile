@@ -11,6 +11,8 @@ ENV https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 all_proxy
 RUN apt-get update
 RUN apt-get install -y git ninja-build cmake build-essential libopenblas-dev \
     xterm xauth openssh-server tmux wget mate-desktop-environment-core
+RUN apt-get install -y sudo && \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Create user group
 ARG USER_ID=1000
