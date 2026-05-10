@@ -404,6 +404,8 @@ def main():
     sampler_net.eval()
     for p in sampler_net.parameters():
         p.requires_grad = False
+    sampler_net.jit_compile()
+    logging.info("HeightMapSampler JIT compiled.")
 
     sampler_params = sum(p.numel() for p in sampler_net.parameters())
     logging.info(f"高度图采样网络参数量: {sampler_params:,} ({sampler_params / 1e6:.3f}M)")
