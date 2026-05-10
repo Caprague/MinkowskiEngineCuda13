@@ -82,9 +82,9 @@ parser.add_argument("--duration", type=float, default=60.0,
                     help="测试持续时间 (秒)")
 parser.add_argument("--warmup", type=float, default=5.0,
                     help="预热时间 (秒)")
-parser.add_argument("--completion_hz", type=float, default=10.0,
+parser.add_argument("--completion_hz", type=float, default=5.0,
                     help="补全线程目标频率")
-parser.add_argument("--sampler_hz", type=float, default=50.0,
+parser.add_argument("--sampler_hz", type=float, default=25.0,
                     help="采样线程目标频率")
 parser.add_argument("--completion_checkpoint", type=str,
                     default="./output/checkpoint/lidar_completion_x64_v2/export/model.pth")
