@@ -200,6 +200,7 @@ parser.add_argument("--num_workers",           type=int,                default=
 parser.add_argument("--log_dir",               type=str,                default="./output/logs_heightmap_x64")
 parser.add_argument("--save_dir",              type=str,                default="./output/checkpoint")
 parser.add_argument("--model_name",            type=str,                default="heightmap_sampler_v0")
+parser.add_argument("--load_optimizer",        type=str,                default=True)
 parser.add_argument("--max_visualization",     type=int,                default=20)
 parser.add_argument("--resume",                action="store_true")
 parser.add_argument("--eval",                  action="store_true")
@@ -470,6 +471,12 @@ class HeightMapSampler(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim // 2, num_bins + 1),
         )
+
+    def jit_compile(self):
+        """对 MLP 子网络进行 TorchScript 编译以加速推理。"""
+        self.point_encoder = torch.jit.script(self.point_encoder)
+        self.local_mlp = torch.jit.script(self.local_mlp)
+        self.query_mlp = torch.jit.script(self.query_mlp)
 
     def generate_grid(self, center_xy, device, yaw=0.0):
         """封装 generate_grid_xy，使用内部存储的 grid_size / grid_res。"""
@@ -1282,34 +1289,68 @@ if __name__ == "__main__":
         if config.resume:
             checkpoint_dir = os.path.join(config.save_dir, config.model_name)
             ckpt_files = glob.glob(os.path.join(checkpoint_dir, "sampler_*.pth"))
-            if ckpt_files:
+
+            if not ckpt_files:
+                logging.warning(f"No checkpoint found in {checkpoint_dir}. Starting from scratch.")
+            else:
                 ckpt_files.sort(key=lambda f: int(os.path.basename(f).split("_")[-1].split(".")[0]))
                 latest = ckpt_files[-1]
-                logging.info(f"Resuming sampler from: {latest}")
-                state = torch.load(latest, map_location=device)
-                sampler_net.load_state_dict(state["sampler_state_dict"])
-                optimizer.load_state_dict(state["optimizer"])
-                if "scheduler" in state:
-                    scheduler.load_state_dict(state["scheduler"])
-                start_iter = state["curr_iter"] + 1
-                start_step = state["curr_step"] + 1
-            else:
-                logging.warning("No sampler checkpoint found. Starting from scratch.")
+                logging.info(f"Resuming from latest checkpoint: {latest}")
+
+                try:
+                    state = torch.load(latest, map_location=device)
+                    sampler_net.load_state_dict(state["sampler_state_dict"])
+                    if config.load_optimizer:
+                        optimizer.load_state_dict(state["optimizer"])
+                        if "scheduler" in state:
+                            scheduler.load_state_dict(state["scheduler"])
+
+                    filename = os.path.basename(latest)
+                    start_iter = state["curr_iter"] + 1
+                    start_step = state["curr_step"] + 1
+                    logging.info(f"Loaded model: {filename}")
+                    logging.info(f"Resuming from iteration {start_iter} (based on saved state)")
+                except Exception as e:
+                    logging.error(f"Failed to load checkpoint: {e}")
+                    logging.info("Starting training from scratch.")
 
         train(completion_net, sampler_net, dataloader, optimizer, scheduler,
               start_iter, start_step, device, config)
 
     else:
-        # 可视化模式: 加载采样器最新权重
+        # 可视化/评估模式: 加载采样器最新权重
         checkpoint_dir = os.path.join(config.save_dir, config.model_name)
+        if not os.path.exists(checkpoint_dir):
+            raise FileNotFoundError(f"Model directory not found at: {checkpoint_dir}")
+
         ckpt_files = glob.glob(os.path.join(checkpoint_dir, "sampler_*.pth"))
         if not ckpt_files:
             raise FileNotFoundError(f"No sampler checkpoints found in {checkpoint_dir}")
+
         ckpt_files.sort(key=lambda f: int(os.path.basename(f).split("_")[-1].split(".")[0]))
         latest = ckpt_files[-1]
-        logging.info(f"Evaluating sampler from: {latest}")
+
+        try:
+            filename = os.path.basename(latest)
+            latest_iter = int(filename.split('_')[-1].split('.')[0])
+        except Exception as e:
+            logging.warning(f"无法从文件名 {filename} 解析 Iteration，设为 Unknown。Error: {e}")
+            latest_iter = -1
+
+        logging.info(f"Found latest checkpoint: {os.path.basename(latest)} (Iter: {latest_iter})")
         state = torch.load(latest, map_location=device)
         sampler_net.load_state_dict(state["sampler_state_dict"])
+        logging.info("Load weights success.")
+
+        # export model weights
+        model_export_path = os.path.join(checkpoint_dir, "export")
+        os.makedirs(model_export_path, exist_ok=True)
+        model_export_file = os.path.join(model_export_path, "model.pth")
+        torch.save({"sampler_state_dict": sampler_net.state_dict()}, model_export_file)
+        logging.info(f"Export model weights to: {model_export_file}")
+
+        sampler_net.jit_compile()
+        logging.info("HeightMapSampler JIT compiled.")
 
         vis_dataloader = make_data_loader(
             phase="train",

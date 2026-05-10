@@ -89,7 +89,7 @@ parser.add_argument("--sampler_hz", type=float, default=25.0,
 parser.add_argument("--completion_checkpoint", type=str,
                     default="./output/checkpoint/lidar_completion_x64_v2/export/model.pth")
 parser.add_argument("--sampler_checkpoint", type=str,
-                    default="./output/checkpoint/heightmap_sampler_v0/sampler_2000.pth")
+                    default="./output/checkpoint/heightmap_sampler_v0/export/model.pth")
 parser.add_argument("--batch_size", type=int, default=1)
 
 
